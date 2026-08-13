@@ -72,7 +72,7 @@ cp .env.example .env
 
 Тот же `docker-compose.yml`. В Dokploy нужны только: Git-репозиторий, переменные окружения и домен. Не добавляйте в compose свои настройки Traefik или сети.
 
-1. Подключите этот приватный GitHub-репозиторий.
+1. Подключите этот GitHub-репозиторий.
 2. Новое приложение **Compose**, файл `docker-compose.yml`.
 3. Environment — скопируйте `.env.example` и поменяйте хотя бы:
    - `SITE_URL=https://oc.ваш.домен/` — **со слэшем в конце**
@@ -116,4 +116,4 @@ git tag v1.2.0
 git push origin v1.2.0
 ```
 
-Образ приватный, как и репозиторий. Для `docker pull` нужен `docker login ghcr.io`.
+Образ публичный: `docker pull ghcr.io/akhilya/delegat-shop-opencart:latest` без логина.

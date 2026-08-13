@@ -72,7 +72,7 @@ On OpenCart, `SITE_URL` **must end with a slash**, for example `http://localhost
 
 Same `docker-compose.yml`. In Dokploy you only need: the Git repo, environment variables, and a domain. Do not add extra Traefik / network settings in the compose file.
 
-1. Connect this private GitHub repo.
+1. Connect this GitHub repo.
 2. New **Compose** app, file `docker-compose.yml`.
 3. Environment — copy `.env.example` and change at least:
    - `SITE_URL=https://oc.your.domain/` — **slash at the end**
@@ -116,4 +116,4 @@ git tag v1.2.0
 git push origin v1.2.0
 ```
 
-The image is private (same as this repo). `docker pull` needs `docker login ghcr.io`.
+Anyone can pull `ghcr.io/akhilya/delegat-shop-opencart:latest` without logging in.
