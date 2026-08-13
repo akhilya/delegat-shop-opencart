@@ -1,0 +1,1373 @@
+<?php
+namespace Opencart\Catalog\Controller\Extension\DelegatBridge\Api;
+
+class Delegat extends \Opencart\System\Engine\Controller {
+    public function index() {
+        try {
+            $this->authenticate();
+
+            $action = isset($this->request->get['action']) ? trim($this->request->get['action']) : 'health';
+            $payload = $this->readJsonBody();
+
+            switch ($action) {
+                case 'health':
+                    $this->json($this->health());
+                    return;
+
+                case 'categories':
+                    $this->json($this->categories());
+                    return;
+
+                case 'categories.upsert':
+                case 'categories_upsert':
+                    $this->json($this->upsertCategory($payload));
+                    return;
+
+                case 'category.fields':
+                case 'category_fields':
+                    $this->json($this->categoryFields());
+                    return;
+
+                case 'products.upsert':
+                case 'products_upsert':
+                    $this->json($this->upsertProduct($payload));
+                    return;
+
+                case 'products.bulk':
+                case 'products_bulk':
+                    $this->json($this->bulkProducts($payload));
+                    return;
+
+                case 'products':
+                    $this->json($this->products());
+                    return;
+
+                case 'prices.bulk':
+                case 'prices_bulk':
+                    $this->json($this->bulkPrices($payload));
+                    return;
+
+                case 'stocks.bulk':
+                case 'stocks_bulk':
+                    $this->json($this->bulkStocks($payload));
+                    return;
+
+                default:
+                    $this->jsonError('Unknown action: ' . $action, 404);
+                    return;
+            }
+        } catch (\Exception $e) {
+            $this->jsonError($e->getMessage(), 500, array(
+                'exception' => get_class($e),
+                'file' => $e->getFile(),
+                'line' => $e->getLine()
+            ));
+        }
+    }
+
+    private function authenticate() {
+        if (!(int)$this->config->get('module_delegat_bridge_status')) {
+            throw new \Exception('Delegat Bridge is disabled');
+        }
+
+        $configured_key = trim((string)$this->config->get('module_delegat_bridge_api_key'));
+        if ($configured_key === '') {
+            throw new \Exception('Delegat Bridge API key is not configured');
+        }
+
+        $allowed_ips = $this->parseAllowedIps((string)$this->config->get('module_delegat_bridge_allowed_ips'));
+        if ($allowed_ips) {
+            $remote_ip = isset($this->request->server['REMOTE_ADDR']) ? $this->request->server['REMOTE_ADDR'] : '';
+            if (!in_array($remote_ip, $allowed_ips, true)) {
+                $this->jsonError('IP address is not allowed', 403);
+                exit;
+            }
+        }
+
+        $provided_key = $this->getProvidedApiKey();
+        if ($provided_key === '' || !hash_equals($configured_key, $provided_key)) {
+            $this->jsonError('Invalid API key', 401);
+            exit;
+        }
+    }
+
+    private function health() {
+        return array(
+            'store_name' => $this->config->get('config_name'),
+            'version' => defined('VERSION') ? VERSION : '',
+            'api_version' => '1.0.0',
+            'store_id' => $this->getDefaultStoreId(),
+            'language_id' => $this->getDefaultLanguageId(),
+            'capabilities' => array(
+                'categories',
+                'categories.upsert',
+                'category.fields',
+                'products',
+                'products.upsert',
+                'products.bulk',
+                'prices.bulk',
+                'stocks.bulk',
+                'image.download'
+            )
+        );
+    }
+
+    private function categories() {
+        $language_id = $this->getDefaultLanguageId();
+        $parent_id = isset($this->request->get['parent_id']) && $this->request->get['parent_id'] !== ''
+            ? (int)$this->request->get['parent_id']
+            : null;
+        $search = isset($this->request->get['search']) ? trim($this->request->get['search']) : '';
+
+        $sql = "SELECT c.category_id, c.parent_id, cd.name, c.status
+                FROM `" . DB_PREFIX . "category` c
+                LEFT JOIN `" . DB_PREFIX . "category_description` cd
+                    ON (c.category_id = cd.category_id AND cd.language_id = " . (int)$language_id . ")
+                WHERE c.status = 1";
+
+        if ($parent_id !== null) {
+            $sql .= " AND c.parent_id = " . (int)$parent_id;
+        }
+
+        if ($search !== '') {
+            $sql .= " AND cd.name LIKE '%" . $this->db->escape($search) . "%'";
+        }
+
+        $sql .= " ORDER BY c.sort_order ASC, cd.name ASC";
+
+        $rows = $this->db->query($sql)->rows;
+        $all = $this->getCategoryNameMap($language_id);
+        $result = array();
+
+        foreach ($rows as $row) {
+            $children_count = $this->countCategoryChildren((int)$row['category_id']);
+            $parent_name = isset($all[(int)$row['parent_id']]) ? $all[(int)$row['parent_id']]['name'] : null;
+
+            $result[] = array(
+                'id' => (string)$row['category_id'],
+                'name' => $row['name'],
+                'parent_id' => (int)$row['parent_id'] > 0 ? (string)$row['parent_id'] : null,
+                'parent_name' => $parent_name,
+                'full_path' => $this->buildCategoryPath((int)$row['category_id'], $all),
+                'has_children' => $children_count > 0,
+                'children_count' => $children_count
+            );
+        }
+
+        return $result;
+    }
+
+    private function categoryFields() {
+        $language_id = $this->getDefaultLanguageId();
+        $fields = $this->baseProductFields();
+
+        $attribute_sql = "SELECT a.attribute_id, ad.name, agd.name AS group_name
+                          FROM `" . DB_PREFIX . "attribute` a
+                          LEFT JOIN `" . DB_PREFIX . "attribute_description` ad
+                              ON (a.attribute_id = ad.attribute_id AND ad.language_id = " . (int)$language_id . ")
+                          LEFT JOIN `" . DB_PREFIX . "attribute_group_description` agd
+                              ON (a.attribute_group_id = agd.attribute_group_id AND agd.language_id = " . (int)$language_id . ")
+                          ORDER BY a.sort_order ASC, ad.name ASC";
+
+        foreach ($this->db->query($attribute_sql)->rows as $row) {
+            $fields[] = array(
+                'key' => 'attr:' . $row['attribute_id'],
+                'name' => $row['name'],
+                'is_required' => false,
+                'type' => 'string',
+                'group' => $row['group_name'] ? 'Attributes: ' . $row['group_name'] : 'Attributes',
+                'sort_order' => 1000 + (int)$row['attribute_id']
+            );
+        }
+
+        $option_sql = "SELECT o.option_id, o.type, od.name
+                       FROM `" . DB_PREFIX . "option` o
+                       LEFT JOIN `" . DB_PREFIX . "option_description` od
+                           ON (o.option_id = od.option_id AND od.language_id = " . (int)$language_id . ")
+                       ORDER BY o.sort_order ASC, od.name ASC";
+
+        foreach ($this->db->query($option_sql)->rows as $row) {
+            $options = array();
+            $value_sql = "SELECT ov.option_value_id, ovd.name
+                          FROM `" . DB_PREFIX . "option_value` ov
+                          LEFT JOIN `" . DB_PREFIX . "option_value_description` ovd
+                              ON (ov.option_value_id = ovd.option_value_id AND ovd.language_id = " . (int)$language_id . ")
+                          WHERE ov.option_id = " . (int)$row['option_id'] . "
+                          ORDER BY ov.sort_order ASC, ovd.name ASC";
+
+            foreach ($this->db->query($value_sql)->rows as $value) {
+                $options[] = array(
+                    'value' => (string)$value['option_value_id'],
+                    'label' => $value['name']
+                );
+            }
+
+            $type = $row['type'] === 'checkbox' ? 'multiselect' : ($options ? 'select' : 'string');
+            $fields[] = array(
+                'key' => 'option:' . $row['option_id'],
+                'name' => $row['name'],
+                'is_required' => false,
+                'type' => $type,
+                'options' => $options,
+                'group' => 'Options',
+                'sort_order' => 2000 + (int)$row['option_id']
+            );
+        }
+
+        return $fields;
+    }
+
+    private function upsertCategory($payload) {
+        $name = isset($payload['name']) ? trim((string)$payload['name']) : '';
+        if ($name === '') {
+            throw new \Exception('Category name is required');
+        }
+
+        $language_id = isset($payload['language_id']) && $payload['language_id'] !== null
+            ? (int)$payload['language_id']
+            : $this->getDefaultLanguageId();
+        $store_id = isset($payload['store_id']) && $payload['store_id'] !== null
+            ? (int)$payload['store_id']
+            : $this->getDefaultStoreId();
+        $parent_id = isset($payload['parent_id']) && $payload['parent_id'] !== null && $payload['parent_id'] !== ''
+            ? (int)$payload['parent_id']
+            : 0;
+        $sort_order = isset($payload['sort_order']) ? (int)$payload['sort_order'] : 0;
+        $description = isset($payload['description']) ? (string)$payload['description'] : '';
+
+        $this->ensureCategorySchema();
+
+        $category_id = $this->resolveCategoryIdByName($name, $parent_id, $language_id);
+        if ($category_id > 0) {
+            $fields = $this->buildCategoryAssignments($parent_id, $sort_order, false);
+            if ($fields) {
+                $this->db->query("UPDATE `" . DB_PREFIX . "category` SET " . implode(', ', $fields) . " WHERE category_id = " . (int)$category_id);
+            }
+        } else {
+            $fields = $this->buildCategoryAssignments($parent_id, $sort_order, true);
+            if ($fields) {
+                $this->db->query("INSERT INTO `" . DB_PREFIX . "category` SET " . implode(', ', $fields));
+            } else {
+                $this->db->query("INSERT INTO `" . DB_PREFIX . "category` () VALUES ()");
+            }
+            $category_id = (int)$this->db->getLastId();
+        }
+
+        $this->saveCategoryDescription($category_id, $language_id, $name, $description);
+        $this->saveCategoryStore($category_id, $store_id);
+        $this->saveCategoryPath($category_id, $parent_id);
+
+        $fields = isset($payload['fields']) && is_array($payload['fields']) ? $payload['fields'] : array();
+        $created_attribute_ids = array();
+        foreach ($fields as $field) {
+            $field_name = isset($field['name']) ? trim((string)$field['name']) : '';
+            if ($field_name === '') {
+                continue;
+            }
+
+            $group_name = isset($field['group']) && trim((string)$field['group']) !== ''
+                ? trim((string)$field['group'])
+                : 'Delegat';
+            $group_id = $this->ensureAttributeGroup($group_name, $language_id);
+            $attribute_id = $this->ensureAttribute($field_name, $group_id, $language_id, isset($field['sort_order']) ? (int)$field['sort_order'] : 0);
+            if ($attribute_id > 0) {
+                $created_attribute_ids[] = $attribute_id;
+            }
+        }
+
+        return array(
+            'success' => true,
+            'category_id' => (string)$category_id,
+            'id' => (string)$category_id,
+            'name' => $name,
+            'fields' => $this->categoryResponseFields($created_attribute_ids, $language_id),
+            'message' => 'Category created'
+        );
+    }
+
+    private function upsertProduct($payload) {
+        $product = isset($payload['product']) && is_array($payload['product']) ? $payload['product'] : $payload;
+        $product_id = $this->resolveProductId($product);
+
+        if ($product_id > 0) {
+            $this->updateProduct($product_id, $product);
+        } else {
+            $product_id = $this->createProduct($product);
+        }
+
+        $this->saveProductDescriptions($product_id, $product);
+        $this->saveProductStore($product_id, $product);
+        $this->saveProductCategories($product_id, $product);
+        $this->saveProductAttributes($product_id, $product);
+        $this->saveProductOptions($product_id, $product);
+        $image_result = $this->saveProductImages($product_id, $product);
+        $this->saveProductSpecial($product_id, $product);
+
+        return array(
+            'success' => true,
+            'product_id' => (string)$product_id,
+            'sku' => isset($product['sku']) ? (string)$product['sku'] : null,
+            'details' => array(
+                'images' => $image_result
+            )
+        );
+    }
+
+    private function bulkProducts($payload) {
+        $items = isset($payload['items']) && is_array($payload['items']) ? $payload['items'] : array();
+        $results = array();
+
+        foreach ($items as $item) {
+            $local_product_id = isset($item['local_product_id']) ? (int)$item['local_product_id'] : 0;
+            $product = isset($item['product']) && is_array($item['product']) ? $item['product'] : array();
+
+            if (!isset($product['product_id']) && isset($item['existing_external_id']) && $item['existing_external_id'] !== '') {
+                $product['product_id'] = $item['existing_external_id'];
+            }
+
+            try {
+                $result = $this->upsertProduct($product);
+                $results[] = array(
+                    'local_product_id' => $local_product_id,
+                    'success' => true,
+                    'product_id' => $result['product_id'],
+                    'details' => isset($result['details']) ? $result['details'] : null
+                );
+            } catch (\Exception $e) {
+                $results[] = array(
+                    'local_product_id' => $local_product_id,
+                    'success' => false,
+                    'error_message' => $e->getMessage()
+                );
+            }
+        }
+
+        return array('items' => $results);
+    }
+
+    private function products() {
+        $language_id = $this->getDefaultLanguageId();
+        $limit = isset($this->request->get['page_size']) ? (int)$this->request->get['page_size'] : 50;
+        if ($limit < 1) $limit = 50;
+        if ($limit > 200) $limit = 200;
+
+        $offset = isset($this->request->get['cursor']) ? (int)$this->request->get['cursor'] : 0;
+        if ($offset < 0) $offset = 0;
+
+        $search = '';
+        if (isset($this->request->get['offer_id_search'])) {
+            $search = trim((string)$this->request->get['offer_id_search']);
+        } elseif (isset($this->request->get['search'])) {
+            $search = trim((string)$this->request->get['search']);
+        }
+
+        $sku_select = $this->tableColumnExists('product', 'sku') ? 'p.sku' : "''";
+        $where = " WHERE p.status = 1";
+        if ($search !== '') {
+            $escaped = $this->db->escape($search);
+            $where .= " AND (p.model LIKE '%" . $escaped . "%'";
+            if (ctype_digit($search)) {
+                $where .= " OR p.product_id = " . (int)$search;
+            }
+            if ($this->tableColumnExists('product', 'sku')) {
+                $where .= " OR p.sku LIKE '%" . $escaped . "%'";
+            }
+            $where .= " OR pd.name LIKE '%" . $escaped . "%')";
+        }
+
+        $sql = "SELECT
+                    p.product_id,
+                    p.model,
+                    " . $sku_select . " AS sku,
+                    p.price,
+                    p.quantity,
+                    p.image,
+                    pd.name,
+                    pd.description,
+                    pc.category_id,
+                    cd.name AS category_name
+                FROM `" . DB_PREFIX . "product` p
+                LEFT JOIN `" . DB_PREFIX . "product_description` pd
+                    ON (p.product_id = pd.product_id AND pd.language_id = " . (int)$language_id . ")
+                LEFT JOIN (
+                    SELECT product_id, MIN(category_id) AS category_id
+                    FROM `" . DB_PREFIX . "product_to_category`
+                    GROUP BY product_id
+                ) pc ON (p.product_id = pc.product_id)
+                LEFT JOIN `" . DB_PREFIX . "category_description` cd
+                    ON (pc.category_id = cd.category_id AND cd.language_id = " . (int)$language_id . ")"
+                . $where . "
+                ORDER BY p.product_id ASC
+                LIMIT " . (int)$offset . ", " . (int)($limit + 1);
+
+        $rows = $this->db->query($sql)->rows;
+        $has_more = count($rows) > $limit;
+        if ($has_more) {
+            $rows = array_slice($rows, 0, $limit);
+        }
+
+        $items = array();
+        foreach ($rows as $row) {
+            $items[] = array(
+                'external_id' => (string)$row['product_id'],
+                'sku' => $row['sku'] !== '' ? (string)$row['sku'] : (string)$row['model'],
+                'model' => (string)$row['model'],
+                'name' => isset($row['name']) ? (string)$row['name'] : '',
+                'description' => isset($row['description']) ? (string)$row['description'] : '',
+                'price' => isset($row['price']) ? (float)$row['price'] : null,
+                'quantity' => isset($row['quantity']) ? (int)$row['quantity'] : null,
+                'category_id' => isset($row['category_id']) ? (string)$row['category_id'] : null,
+                'category_name' => isset($row['category_name']) ? (string)$row['category_name'] : null,
+                'image_urls' => $this->productImageUrls((int)$row['product_id'], isset($row['image']) ? (string)$row['image'] : '')
+            );
+        }
+
+        return array(
+            'items' => $items,
+            'has_more' => $has_more,
+            'next_cursor' => $has_more ? (string)($offset + $limit) : null
+        );
+    }
+
+    private function bulkPrices($payload) {
+        $items = isset($payload['items']) && is_array($payload['items']) ? $payload['items'] : array();
+        $errors = array();
+        $success = 0;
+
+        foreach ($items as $item) {
+            $product_id = isset($item['external_product_id']) ? (int)$item['external_product_id'] : 0;
+            if ($product_id <= 0 || !$this->productExists($product_id)) {
+                $errors[] = array('external_id' => (string)$product_id, 'message' => 'Product not found');
+                continue;
+            }
+
+            $updates = array();
+            if (array_key_exists('price', $item) && $item['price'] !== null) {
+                $updates[] = "price = '" . (float)$item['price'] . "'";
+            }
+
+            if ($updates) {
+                $this->db->query("UPDATE `" . DB_PREFIX . "product` SET " . implode(', ', $updates) . ", date_modified = NOW() WHERE product_id = " . (int)$product_id);
+            }
+
+            if (array_key_exists('special_price', $item) && $item['special_price'] !== null) {
+                $this->replaceSpecialPrice($product_id, (float)$item['special_price']);
+            }
+
+            $success++;
+        }
+
+        return array(
+            'total_count' => count($items),
+            'success_count' => $success,
+            'failed_count' => count($errors),
+            'errors' => $errors
+        );
+    }
+
+    private function bulkStocks($payload) {
+        $items = isset($payload['items']) && is_array($payload['items']) ? $payload['items'] : array();
+        $errors = array();
+        $success = 0;
+
+        foreach ($items as $item) {
+            $product_id = isset($item['external_product_id']) ? (int)$item['external_product_id'] : 0;
+            if ($product_id <= 0 || !$this->productExists($product_id)) {
+                $errors[] = array('external_id' => (string)$product_id, 'message' => 'Product not found');
+                continue;
+            }
+
+            $quantity = isset($item['quantity']) ? (int)$item['quantity'] : 0;
+            $this->db->query("UPDATE `" . DB_PREFIX . "product` SET quantity = " . (int)$quantity . ", date_modified = NOW() WHERE product_id = " . (int)$product_id);
+            $success++;
+        }
+
+        return array(
+            'total_count' => count($items),
+            'success_count' => $success,
+            'failed_count' => count($errors),
+            'errors' => $errors
+        );
+    }
+
+    private function createProduct($product) {
+        $name = isset($product['name']) ? trim((string)$product['name']) : '';
+        $model = isset($product['model']) ? trim((string)$product['model']) : '';
+
+        if ($model === '' && isset($product['sku'])) {
+            $model = trim((string)$product['sku']);
+        }
+
+        if ($name === '') {
+            throw new \Exception('Product name is required for new products');
+        }
+
+        if ($model === '') {
+            throw new \Exception('Product model or SKU is required for new products');
+        }
+
+        $fields = array(
+            "model = '" . $this->db->escape($model) . "'",
+            "sku = '" . $this->db->escape(isset($product['sku']) ? (string)$product['sku'] : '') . "'",
+            "quantity = " . (int)$this->value($product, 'quantity', 0),
+            "stock_status_id = " . (int)$this->value($product, 'stock_status_id', $this->config->get('config_stock_status_id')),
+            "manufacturer_id = " . (int)$this->resolveManufacturerId($product),
+            "shipping = " . (int)$this->value($product, 'shipping', 1),
+            "price = '" . (float)$this->value($product, 'price', 0) . "'",
+            "points = 0",
+            "tax_class_id = " . (int)$this->value($product, 'tax_class_id', 0),
+            "date_available = CURDATE()",
+            "weight = '" . (float)$this->value($product, 'weight', 0) . "'",
+            "weight_class_id = " . (int)$this->value($product, 'weight_class_id', $this->config->get('config_weight_class_id')),
+            "length = '" . (float)$this->value($product, 'length', 0) . "'",
+            "width = '" . (float)$this->value($product, 'width', 0) . "'",
+            "height = '" . (float)$this->value($product, 'height', 0) . "'",
+            "length_class_id = " . (int)$this->value($product, 'length_class_id', $this->config->get('config_length_class_id')),
+            "subtract = 1",
+            "minimum = " . (int)$this->value($product, 'minimum', 1),
+            "sort_order = " . (int)$this->value($product, 'sort_order', 0),
+            "status = " . (int)$this->value($product, 'status', 1),
+            "date_added = NOW()",
+            "date_modified = NOW()"
+        );
+
+        if ($this->tableColumnExists('product', 'variant')) {
+            $fields[] = "`variant` = '{}'";
+        }
+
+        $this->db->query("INSERT INTO `" . DB_PREFIX . "product` SET " . implode(', ', $fields));
+        $product_id = (int)$this->db->getLastId();
+        $this->normalizeProductCartJsonFields($product_id);
+
+        return $product_id;
+    }
+
+    private function updateProduct($product_id, $product) {
+        if (!$this->productExists($product_id)) {
+            throw new \Exception('Product not found: ' . $product_id);
+        }
+
+        $updates = array();
+        $map = array(
+            'model' => 'string',
+            'sku' => 'string',
+            'quantity' => 'int',
+            'stock_status_id' => 'int',
+            'shipping' => 'bool',
+            'price' => 'float',
+            'tax_class_id' => 'int',
+            'weight' => 'float',
+            'weight_class_id' => 'int',
+            'length' => 'float',
+            'width' => 'float',
+            'height' => 'float',
+            'length_class_id' => 'int',
+            'minimum' => 'int',
+            'sort_order' => 'int',
+            'status' => 'bool'
+        );
+
+        foreach ($map as $key => $type) {
+            if (!array_key_exists($key, $product) || $product[$key] === null) {
+                continue;
+            }
+
+            $column = $key;
+            if ($type === 'string') {
+                $updates[] = "`" . $column . "` = '" . $this->db->escape((string)$product[$key]) . "'";
+            } elseif ($type === 'float') {
+                $updates[] = "`" . $column . "` = '" . (float)$product[$key] . "'";
+            } elseif ($type === 'bool') {
+                $updates[] = "`" . $column . "` = " . (int)$product[$key];
+            } else {
+                $updates[] = "`" . $column . "` = " . (int)$product[$key];
+            }
+        }
+
+        if (array_key_exists('manufacturer', $product) && $product['manufacturer'] !== null) {
+            $updates[] = "manufacturer_id = " . (int)$this->resolveManufacturerId($product);
+        }
+
+        if ($updates) {
+            $updates[] = "date_modified = NOW()";
+            $this->db->query("UPDATE `" . DB_PREFIX . "product` SET " . implode(', ', $updates) . " WHERE product_id = " . (int)$product_id);
+        }
+
+        $this->normalizeProductCartJsonFields($product_id);
+    }
+
+    private function normalizeProductCartJsonFields($product_id) {
+        if ($this->tableColumnExists('product', 'variant')) {
+            $this->db->query("UPDATE `" . DB_PREFIX . "product`
+                SET `variant` = '{}'
+                WHERE product_id = " . (int)$product_id . "
+                    AND (`variant` IS NULL OR `variant` = '')");
+        }
+    }
+
+    private function saveProductDescriptions($product_id, $product) {
+        $has_description_data = false;
+        foreach (array('name', 'description', 'tag', 'meta_title', 'meta_description', 'meta_keyword') as $key) {
+            if (array_key_exists($key, $product) && $product[$key] !== null) {
+                $has_description_data = true;
+                break;
+            }
+        }
+
+        if (!$has_description_data) {
+            return;
+        }
+
+        $source_language_id = isset($product['language_id']) && $product['language_id'] !== null
+            ? (int)$product['language_id']
+            : $this->getDefaultLanguageId();
+
+        $source_existing = $this->db->query("SELECT * FROM `" . DB_PREFIX . "product_description` WHERE product_id = " . (int)$product_id . " AND language_id = " . (int)$source_language_id)->row;
+        $base_name = $this->value($product, 'name', isset($source_existing['name']) ? $source_existing['name'] : '');
+        $base_description = $this->value($product, 'description', isset($source_existing['description']) ? $source_existing['description'] : '');
+        $base_tag = $this->value($product, 'tag', isset($source_existing['tag']) ? $source_existing['tag'] : '');
+        $base_meta_title = $this->value($product, 'meta_title', isset($source_existing['meta_title']) ? $source_existing['meta_title'] : $base_name);
+        $base_meta_description = $this->value($product, 'meta_description', isset($source_existing['meta_description']) ? $source_existing['meta_description'] : '');
+        $base_meta_keyword = $this->value($product, 'meta_keyword', isset($source_existing['meta_keyword']) ? $source_existing['meta_keyword'] : '');
+
+        foreach ($this->getProductDescriptionLanguageIds($source_language_id) as $language_id) {
+            $existing = $this->db->query("SELECT * FROM `" . DB_PREFIX . "product_description` WHERE product_id = " . (int)$product_id . " AND language_id = " . (int)$language_id)->row;
+
+            $name = $this->value($product, 'name', isset($existing['name']) ? $existing['name'] : $base_name);
+            $description = $this->value($product, 'description', isset($existing['description']) ? $existing['description'] : $base_description);
+            $tag = $this->value($product, 'tag', isset($existing['tag']) ? $existing['tag'] : $base_tag);
+            $meta_title = $this->value($product, 'meta_title', isset($existing['meta_title']) ? $existing['meta_title'] : $base_meta_title);
+            $meta_description = $this->value($product, 'meta_description', isset($existing['meta_description']) ? $existing['meta_description'] : $base_meta_description);
+            $meta_keyword = $this->value($product, 'meta_keyword', isset($existing['meta_keyword']) ? $existing['meta_keyword'] : $base_meta_keyword);
+
+            if ($existing) {
+                $this->db->query("UPDATE `" . DB_PREFIX . "product_description` SET
+                    name = '" . $this->db->escape((string)$name) . "',
+                    description = '" . $this->db->escape((string)$description) . "',
+                    tag = '" . $this->db->escape((string)$tag) . "',
+                    meta_title = '" . $this->db->escape((string)$meta_title) . "',
+                    meta_description = '" . $this->db->escape((string)$meta_description) . "',
+                    meta_keyword = '" . $this->db->escape((string)$meta_keyword) . "'
+                    WHERE product_id = " . (int)$product_id . " AND language_id = " . (int)$language_id);
+            } else {
+                $this->db->query("INSERT INTO `" . DB_PREFIX . "product_description` SET
+                    product_id = " . (int)$product_id . ",
+                    language_id = " . (int)$language_id . ",
+                    name = '" . $this->db->escape((string)$name) . "',
+                    description = '" . $this->db->escape((string)$description) . "',
+                    tag = '" . $this->db->escape((string)$tag) . "',
+                    meta_title = '" . $this->db->escape((string)$meta_title) . "',
+                    meta_description = '" . $this->db->escape((string)$meta_description) . "',
+                    meta_keyword = '" . $this->db->escape((string)$meta_keyword) . "'");
+            }
+        }
+    }
+
+    private function getProductDescriptionLanguageIds($source_language_id) {
+        $ids = array((int)$source_language_id);
+
+        $sql = "SELECT language_id FROM `" . DB_PREFIX . "language`";
+        if ($this->tableColumnExists('language', 'status')) {
+            $sql .= " WHERE status = 1";
+        }
+        $sql .= " ORDER BY sort_order ASC, name ASC";
+
+        foreach ($this->db->query($sql)->rows as $row) {
+            $language_id = (int)$row['language_id'];
+            if ($language_id > 0) {
+                $ids[] = $language_id;
+            }
+        }
+
+        return array_values(array_unique($ids));
+    }
+
+    private function saveProductStore($product_id, $product) {
+        $store_id = isset($product['store_id']) && $product['store_id'] !== null
+            ? (int)$product['store_id']
+            : $this->getDefaultStoreId();
+
+        $exists = $this->db->query("SELECT product_id FROM `" . DB_PREFIX . "product_to_store` WHERE product_id = " . (int)$product_id . " AND store_id = " . (int)$store_id)->num_rows;
+        if (!$exists) {
+            $this->db->query("INSERT INTO `" . DB_PREFIX . "product_to_store` SET product_id = " . (int)$product_id . ", store_id = " . (int)$store_id);
+        }
+    }
+
+    private function saveProductCategories($product_id, $product) {
+        if (!isset($product['category_ids']) || !is_array($product['category_ids']) || !count($product['category_ids'])) {
+            return;
+        }
+
+        $this->db->query("DELETE FROM `" . DB_PREFIX . "product_to_category` WHERE product_id = " . (int)$product_id);
+        foreach ($product['category_ids'] as $category_id) {
+            $this->db->query("INSERT INTO `" . DB_PREFIX . "product_to_category` SET product_id = " . (int)$product_id . ", category_id = " . (int)$category_id);
+        }
+    }
+
+    private function saveProductAttributes($product_id, $product) {
+        if (!isset($product['attributes']) || !is_array($product['attributes']) || !count($product['attributes'])) {
+            return;
+        }
+
+        $language_id = isset($product['language_id']) && $product['language_id'] !== null
+            ? (int)$product['language_id']
+            : $this->getDefaultLanguageId();
+
+        foreach ($product['attributes'] as $attribute_key => $value) {
+            $attribute_id = (int)$attribute_key;
+            if ($attribute_id <= 0) {
+                $attribute_id = $this->resolveAttributeId((string)$attribute_key);
+            }
+
+            if ($attribute_id <= 0) {
+                continue;
+            }
+
+            $text = is_array($value) ? implode(', ', $value) : (string)$value;
+            $this->db->query("DELETE FROM `" . DB_PREFIX . "product_attribute` WHERE product_id = " . (int)$product_id . " AND attribute_id = " . (int)$attribute_id . " AND language_id = " . (int)$language_id);
+            $this->db->query("INSERT INTO `" . DB_PREFIX . "product_attribute` SET
+                product_id = " . (int)$product_id . ",
+                attribute_id = " . (int)$attribute_id . ",
+                language_id = " . (int)$language_id . ",
+                text = '" . $this->db->escape($text) . "'");
+        }
+    }
+
+    private function saveProductOptions($product_id, $product) {
+        if (!isset($product['options']) || !is_array($product['options']) || !count($product['options'])) {
+            return;
+        }
+
+        foreach ($product['options'] as $option_key => $value) {
+            $option_id = (int)$option_key;
+            if ($option_id <= 0) {
+                continue;
+            }
+
+            $this->db->query("DELETE pov FROM `" . DB_PREFIX . "product_option_value` pov
+                LEFT JOIN `" . DB_PREFIX . "product_option` po ON (pov.product_option_id = po.product_option_id)
+                WHERE po.product_id = " . (int)$product_id . " AND po.option_id = " . (int)$option_id);
+            $this->db->query("DELETE FROM `" . DB_PREFIX . "product_option` WHERE product_id = " . (int)$product_id . " AND option_id = " . (int)$option_id);
+
+            $this->db->query("INSERT INTO `" . DB_PREFIX . "product_option` SET
+                product_id = " . (int)$product_id . ",
+                option_id = " . (int)$option_id . ",
+                value = '',
+                required = 0");
+
+            $product_option_id = (int)$this->db->getLastId();
+            $values = is_array($value) ? $value : array($value);
+
+            foreach ($values as $option_value_id) {
+                if ((int)$option_value_id <= 0) {
+                    continue;
+                }
+
+                $this->db->query("INSERT INTO `" . DB_PREFIX . "product_option_value` SET
+                    product_option_id = " . (int)$product_option_id . ",
+                    product_id = " . (int)$product_id . ",
+                    option_id = " . (int)$option_id . ",
+                    option_value_id = " . (int)$option_value_id . ",
+                    quantity = " . (int)$this->value($product, 'quantity', 0) . ",
+                    subtract = 1,
+                    price = '0.0000',
+                    price_prefix = '+',
+                    points = 0,
+                    points_prefix = '+',
+                    weight = '0.0000',
+                    weight_prefix = '+'");
+            }
+        }
+    }
+
+    private function saveProductImages($product_id, $product) {
+        if (!isset($product['image_urls']) || !is_array($product['image_urls']) || !count($product['image_urls'])) {
+            return array('requested' => 0, 'downloaded' => 0, 'errors' => array());
+        }
+
+        $relative_images = array();
+        $errors = array();
+        foreach ($product['image_urls'] as $url) {
+            $error = '';
+            $downloaded = $this->downloadImage((string)$url, $error);
+            if ($downloaded) {
+                $relative_images[] = $downloaded;
+            } elseif ($error !== '') {
+                $errors[] = array(
+                    'url' => (string)$url,
+                    'message' => $error
+                );
+            }
+        }
+
+        if (!count($relative_images)) {
+            if (count($errors)) {
+                $this->writeLog('Delegat Bridge image download failed for product ' . (int)$product_id . ': ' . json_encode($errors));
+            }
+            return array(
+                'requested' => count($product['image_urls']),
+                'downloaded' => 0,
+                'errors' => $errors
+            );
+        }
+
+        $this->db->query("UPDATE `" . DB_PREFIX . "product` SET image = '" . $this->db->escape($relative_images[0]) . "', date_modified = NOW() WHERE product_id = " . (int)$product_id);
+        $this->db->query("DELETE FROM `" . DB_PREFIX . "product_image` WHERE product_id = " . (int)$product_id);
+
+        $sort_order = 0;
+        foreach (array_slice($relative_images, 1) as $image) {
+            $this->db->query("INSERT INTO `" . DB_PREFIX . "product_image` SET
+                product_id = " . (int)$product_id . ",
+                image = '" . $this->db->escape($image) . "',
+                sort_order = " . (int)$sort_order++);
+        }
+
+        if (count($errors)) {
+            $this->writeLog('Delegat Bridge partial image download failure for product ' . (int)$product_id . ': ' . json_encode($errors));
+        }
+
+        return array(
+            'requested' => count($product['image_urls']),
+            'downloaded' => count($relative_images),
+            'errors' => $errors
+        );
+    }
+
+    private function saveProductSpecial($product_id, $product) {
+        if (!array_key_exists('special_price', $product) || $product['special_price'] === null || $product['special_price'] === '') {
+            return;
+        }
+
+        $this->replaceSpecialPrice($product_id, (float)$product['special_price']);
+    }
+
+    private function replaceSpecialPrice($product_id, $price) {
+        $customer_group_id = (int)$this->config->get('config_customer_group_id');
+        if ($customer_group_id <= 0) {
+            $customer_group_id = 1;
+        }
+
+        $this->db->query("DELETE FROM `" . DB_PREFIX . "product_special` WHERE product_id = " . (int)$product_id . " AND customer_group_id = " . (int)$customer_group_id);
+        $this->db->query("INSERT INTO `" . DB_PREFIX . "product_special` SET
+            product_id = " . (int)$product_id . ",
+            customer_group_id = " . (int)$customer_group_id . ",
+            priority = 1,
+            price = '" . (float)$price . "',
+            date_start = '0000-00-00',
+            date_end = '0000-00-00'");
+    }
+
+    private function resolveProductId($product) {
+        if (isset($product['product_id']) && (int)$product['product_id'] > 0) {
+            return (int)$product['product_id'];
+        }
+
+        if (isset($product['sku']) && trim((string)$product['sku']) !== '') {
+            $query = $this->db->query("SELECT product_id FROM `" . DB_PREFIX . "product` WHERE sku = '" . $this->db->escape((string)$product['sku']) . "' LIMIT 1");
+            if ($query->num_rows) {
+                return (int)$query->row['product_id'];
+            }
+        }
+
+        if (isset($product['model']) && trim((string)$product['model']) !== '') {
+            $query = $this->db->query("SELECT product_id FROM `" . DB_PREFIX . "product` WHERE model = '" . $this->db->escape((string)$product['model']) . "' LIMIT 1");
+            if ($query->num_rows) {
+                return (int)$query->row['product_id'];
+            }
+        }
+
+        return 0;
+    }
+
+    private function productExists($product_id) {
+        return $this->db->query("SELECT product_id FROM `" . DB_PREFIX . "product` WHERE product_id = " . (int)$product_id)->num_rows > 0;
+    }
+
+    private function resolveManufacturerId($product) {
+        if (isset($product['manufacturer_id']) && (int)$product['manufacturer_id'] > 0) {
+            return (int)$product['manufacturer_id'];
+        }
+
+        if (!isset($product['manufacturer']) || trim((string)$product['manufacturer']) === '') {
+            return 0;
+        }
+
+        $name = trim((string)$product['manufacturer']);
+        $query = $this->db->query("SELECT manufacturer_id FROM `" . DB_PREFIX . "manufacturer` WHERE name = '" . $this->db->escape($name) . "' LIMIT 1");
+        if ($query->num_rows) {
+            return (int)$query->row['manufacturer_id'];
+        }
+
+        $this->db->query("INSERT INTO `" . DB_PREFIX . "manufacturer` SET name = '" . $this->db->escape($name) . "', sort_order = 0");
+        $manufacturer_id = (int)$this->db->getLastId();
+        $this->db->query("INSERT INTO `" . DB_PREFIX . "manufacturer_to_store` SET manufacturer_id = " . (int)$manufacturer_id . ", store_id = " . (int)$this->getDefaultStoreId());
+
+        return $manufacturer_id;
+    }
+
+    private function resolveCategoryIdByName($name, $parent_id, $language_id) {
+        $query = $this->db->query("SELECT c.category_id
+            FROM `" . DB_PREFIX . "category` c
+            INNER JOIN `" . DB_PREFIX . "category_description` cd
+                ON (c.category_id = cd.category_id AND cd.language_id = " . (int)$language_id . ")
+            WHERE c.parent_id = " . (int)$parent_id . "
+                AND cd.name = '" . $this->db->escape($name) . "'
+            LIMIT 1");
+
+        return $query->num_rows ? (int)$query->row['category_id'] : 0;
+    }
+
+    private function saveCategoryDescription($category_id, $language_id, $name, $description) {
+        $meta_title = $name;
+        $exists = $this->db->query("SELECT category_id FROM `" . DB_PREFIX . "category_description`
+            WHERE category_id = " . (int)$category_id . " AND language_id = " . (int)$language_id)->num_rows;
+
+        if ($exists) {
+            $this->db->query("UPDATE `" . DB_PREFIX . "category_description` SET
+                name = '" . $this->db->escape($name) . "',
+                description = '" . $this->db->escape($description) . "',
+                meta_title = '" . $this->db->escape($meta_title) . "',
+                meta_description = '',
+                meta_keyword = ''
+                WHERE category_id = " . (int)$category_id . " AND language_id = " . (int)$language_id);
+        } else {
+            $this->db->query("INSERT INTO `" . DB_PREFIX . "category_description` SET
+                category_id = " . (int)$category_id . ",
+                language_id = " . (int)$language_id . ",
+                name = '" . $this->db->escape($name) . "',
+                description = '" . $this->db->escape($description) . "',
+                meta_title = '" . $this->db->escape($meta_title) . "',
+                meta_description = '',
+                meta_keyword = ''");
+        }
+    }
+
+    private function saveCategoryStore($category_id, $store_id) {
+        $exists = $this->db->query("SELECT category_id FROM `" . DB_PREFIX . "category_to_store`
+            WHERE category_id = " . (int)$category_id . " AND store_id = " . (int)$store_id)->num_rows;
+
+        if (!$exists) {
+            $this->db->query("INSERT INTO `" . DB_PREFIX . "category_to_store` SET
+                category_id = " . (int)$category_id . ",
+                store_id = " . (int)$store_id);
+        }
+    }
+
+    private function saveCategoryPath($category_id, $parent_id) {
+        $level = 0;
+        $this->db->query("DELETE FROM `" . DB_PREFIX . "category_path` WHERE category_id = " . (int)$category_id);
+
+        if ($parent_id > 0) {
+            $paths = $this->db->query("SELECT path_id, level FROM `" . DB_PREFIX . "category_path`
+                WHERE category_id = " . (int)$parent_id . "
+                ORDER BY level ASC")->rows;
+
+            foreach ($paths as $path) {
+                $this->db->query("INSERT INTO `" . DB_PREFIX . "category_path` SET
+                    category_id = " . (int)$category_id . ",
+                    path_id = " . (int)$path['path_id'] . ",
+                    level = " . (int)$level++);
+            }
+        }
+
+        $this->db->query("INSERT INTO `" . DB_PREFIX . "category_path` SET
+            category_id = " . (int)$category_id . ",
+            path_id = " . (int)$category_id . ",
+            level = " . (int)$level);
+    }
+
+    private function buildCategoryAssignments($parent_id, $sort_order, $is_insert) {
+        $fields = array();
+
+        if ($this->tableColumnExists('category', 'parent_id')) {
+            $fields[] = "parent_id = " . (int)$parent_id;
+        }
+
+        if ($this->tableColumnExists('category', 'sort_order')) {
+            $fields[] = "sort_order = " . (int)$sort_order;
+        }
+
+        if ($this->tableColumnExists('category', 'status')) {
+            $fields[] = "status = 1";
+        }
+
+        if ($this->tableColumnExists('category', 'top')) {
+            $fields[] = "top = " . ($parent_id === 0 ? 1 : 0);
+        }
+
+        if ($this->tableColumnExists('category', 'column')) {
+            $fields[] = "`column` = 1";
+        }
+
+        if ($is_insert && $this->tableColumnExists('category', 'date_added')) {
+            $fields[] = "date_added = NOW()";
+        }
+
+        if ($this->tableColumnExists('category', 'date_modified')) {
+            $fields[] = "date_modified = NOW()";
+        }
+
+        return $fields;
+    }
+
+    private function ensureCategorySchema() {
+        $this->ensureTableColumn('category', 'parent_id', '`parent_id` int(11) NOT NULL DEFAULT 0');
+        $this->ensureTableColumn('category', 'sort_order', '`sort_order` int(3) NOT NULL DEFAULT 0');
+        $this->ensureTableColumn('category', 'status', '`status` tinyint(1) NOT NULL DEFAULT 1');
+        $this->ensureTableColumn('category', 'date_added', '`date_added` datetime DEFAULT NULL');
+        $this->ensureTableColumn('category', 'date_modified', '`date_modified` datetime DEFAULT NULL');
+        $this->ensureTableColumn('category', 'top', '`top` tinyint(1) NOT NULL DEFAULT 0');
+        $this->ensureTableColumn('category', 'column', '`column` int(3) NOT NULL DEFAULT 1');
+    }
+
+    private function ensureTableColumn($table, $column, $definition) {
+        if (!$this->tableColumnExists($table, $column)) {
+            $this->db->query("ALTER TABLE `" . DB_PREFIX . $this->db->escape($table) . "` ADD COLUMN " . $definition);
+        }
+    }
+
+    private function tableColumnExists($table, $column) {
+        $query = $this->db->query("SHOW COLUMNS FROM `" . DB_PREFIX . $this->db->escape($table) . "` LIKE '" . $this->db->escape($column) . "'");
+        return $query->num_rows > 0;
+    }
+
+    private function resolveAttributeId($name) {
+        $language_id = $this->getDefaultLanguageId();
+        $query = $this->db->query("SELECT attribute_id FROM `" . DB_PREFIX . "attribute_description` WHERE language_id = " . (int)$language_id . " AND name = '" . $this->db->escape($name) . "' LIMIT 1");
+        return $query->num_rows ? (int)$query->row['attribute_id'] : 0;
+    }
+
+    private function ensureAttributeGroup($name, $language_id) {
+        $query = $this->db->query("SELECT attribute_group_id FROM `" . DB_PREFIX . "attribute_group_description`
+            WHERE language_id = " . (int)$language_id . "
+                AND name = '" . $this->db->escape($name) . "'
+            LIMIT 1");
+
+        if ($query->num_rows) {
+            return (int)$query->row['attribute_group_id'];
+        }
+
+        $this->db->query("INSERT INTO `" . DB_PREFIX . "attribute_group` SET sort_order = 0");
+        $attribute_group_id = (int)$this->db->getLastId();
+        $this->db->query("INSERT INTO `" . DB_PREFIX . "attribute_group_description` SET
+            attribute_group_id = " . (int)$attribute_group_id . ",
+            language_id = " . (int)$language_id . ",
+            name = '" . $this->db->escape($name) . "'");
+
+        return $attribute_group_id;
+    }
+
+    private function ensureAttribute($name, $attribute_group_id, $language_id, $sort_order) {
+        $query = $this->db->query("SELECT attribute_id FROM `" . DB_PREFIX . "attribute_description`
+            WHERE language_id = " . (int)$language_id . "
+                AND name = '" . $this->db->escape($name) . "'
+            LIMIT 1");
+
+        if ($query->num_rows) {
+            $attribute_id = (int)$query->row['attribute_id'];
+            $this->db->query("UPDATE `" . DB_PREFIX . "attribute` SET
+                attribute_group_id = " . (int)$attribute_group_id . ",
+                sort_order = " . (int)$sort_order . "
+                WHERE attribute_id = " . (int)$attribute_id);
+            return $attribute_id;
+        }
+
+        $this->db->query("INSERT INTO `" . DB_PREFIX . "attribute` SET
+            attribute_group_id = " . (int)$attribute_group_id . ",
+            sort_order = " . (int)$sort_order);
+        $attribute_id = (int)$this->db->getLastId();
+        $this->db->query("INSERT INTO `" . DB_PREFIX . "attribute_description` SET
+            attribute_id = " . (int)$attribute_id . ",
+            language_id = " . (int)$language_id . ",
+            name = '" . $this->db->escape($name) . "'");
+
+        return $attribute_id;
+    }
+
+    private function downloadImage($url, &$error = null) {
+        $error = '';
+        if (!preg_match('#^https?://#i', $url)) {
+            $error = 'Invalid image URL';
+            return '';
+        }
+
+        $body = false;
+        $content_type = '';
+
+        if (function_exists('curl_init')) {
+            $ch = curl_init($url);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+            curl_setopt($ch, CURLOPT_USERAGENT, 'Delegat-OpenCart-Bridge/1.0');
+            $body = curl_exec($ch);
+            if ($body === false) {
+                $error = 'cURL error: ' . curl_error($ch);
+                curl_close($ch);
+                return '';
+            }
+
+            $content_type = (string)curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
+            $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+
+            if ($status < 200 || $status >= 300) {
+                $error = 'HTTP status ' . $status;
+                return '';
+            }
+        } else {
+            $body = @file_get_contents($url);
+            if ($body === false) {
+                $last_error = error_get_last();
+                $error = isset($last_error['message']) ? $last_error['message'] : 'file_get_contents failed';
+            }
+        }
+
+        if ($body === false || strlen($body) === 0) {
+            if ($error === '') {
+                $error = 'Empty image response';
+            }
+            return '';
+        }
+
+        $extension = $this->guessImageExtension($url, $content_type);
+        $dir = DIR_IMAGE . 'catalog/delegat/';
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
+
+        $relative = 'catalog/delegat/' . md5($url) . '.' . $extension;
+        file_put_contents(DIR_IMAGE . $relative, $body);
+
+        return $relative;
+    }
+
+    private function productImageUrls($product_id, $primary_image) {
+        $images = array();
+        if ($primary_image !== '') {
+            $images[] = $this->imageUrl($primary_image);
+        }
+
+        $query = $this->db->query("SELECT image FROM `" . DB_PREFIX . "product_image` WHERE product_id = " . (int)$product_id . " ORDER BY sort_order ASC, product_image_id ASC");
+        foreach ($query->rows as $row) {
+            if (!isset($row['image']) || trim((string)$row['image']) === '') {
+                continue;
+            }
+            $images[] = $this->imageUrl((string)$row['image']);
+        }
+
+        return array_values(array_unique($images));
+    }
+
+    private function imageUrl($relative) {
+        $relative = ltrim((string)$relative, '/');
+        if (defined('HTTP_CATALOG') && HTTP_CATALOG) {
+            return rtrim(HTTP_CATALOG, '/') . '/image/' . $relative;
+        }
+
+        $server = $this->config->get('config_url');
+        return rtrim((string)$server, '/') . '/image/' . $relative;
+    }
+
+    private function writeLog($message) {
+        if (isset($this->log)) {
+            $this->log->write($message);
+        }
+    }
+
+    private function guessImageExtension($url, $content_type) {
+        $path = parse_url($url, PHP_URL_PATH);
+        $extension = strtolower(pathinfo((string)$path, PATHINFO_EXTENSION));
+        $allowed = array('jpg', 'jpeg', 'png', 'gif', 'webp');
+
+        if (in_array($extension, $allowed, true)) {
+            return $extension === 'jpeg' ? 'jpg' : $extension;
+        }
+
+        if (stripos($content_type, 'png') !== false) return 'png';
+        if (stripos($content_type, 'gif') !== false) return 'gif';
+        if (stripos($content_type, 'webp') !== false) return 'webp';
+
+        return 'jpg';
+    }
+
+    private function baseProductFields() {
+        return array(
+            array('key' => 'sku', 'name' => 'SKU', 'is_required' => true, 'type' => 'string', 'group' => 'Basic', 'sort_order' => 10),
+            array('key' => 'model', 'name' => 'Model', 'is_required' => true, 'type' => 'string', 'group' => 'Basic', 'sort_order' => 20),
+            array('key' => 'name', 'name' => 'Name', 'is_required' => true, 'type' => 'string', 'group' => 'Basic', 'sort_order' => 30),
+            array('key' => 'description', 'name' => 'Description', 'is_required' => false, 'type' => 'string', 'group' => 'Basic', 'sort_order' => 40),
+            array('key' => 'price', 'name' => 'Price', 'is_required' => true, 'type' => 'number', 'group' => 'Commerce', 'sort_order' => 50),
+            array('key' => 'special_price', 'name' => 'Special price', 'is_required' => false, 'type' => 'number', 'group' => 'Commerce', 'sort_order' => 55),
+            array('key' => 'quantity', 'name' => 'Quantity', 'is_required' => false, 'type' => 'integer', 'group' => 'Commerce', 'sort_order' => 60),
+            array('key' => 'images', 'name' => 'Images', 'is_required' => false, 'type' => 'multiselect', 'group' => 'Media', 'sort_order' => 70),
+            array('key' => 'manufacturer', 'name' => 'Manufacturer', 'is_required' => false, 'type' => 'string', 'group' => 'Basic', 'sort_order' => 80),
+            array('key' => 'meta_title', 'name' => 'Meta title', 'is_required' => false, 'type' => 'string', 'group' => 'SEO', 'sort_order' => 90),
+            array('key' => 'meta_description', 'name' => 'Meta description', 'is_required' => false, 'type' => 'string', 'group' => 'SEO', 'sort_order' => 100),
+            array('key' => 'meta_keyword', 'name' => 'Meta keyword', 'is_required' => false, 'type' => 'string', 'group' => 'SEO', 'sort_order' => 105),
+            array('key' => 'tag', 'name' => 'Tags', 'is_required' => false, 'type' => 'string', 'group' => 'SEO', 'sort_order' => 110),
+            array('key' => 'status', 'name' => 'Status', 'is_required' => false, 'type' => 'boolean', 'group' => 'Basic', 'sort_order' => 115),
+            array('key' => 'weight', 'name' => 'Weight', 'is_required' => false, 'type' => 'number', 'group' => 'Shipping', 'sort_order' => 120),
+            array('key' => 'length', 'name' => 'Length', 'is_required' => false, 'type' => 'number', 'group' => 'Shipping', 'sort_order' => 130),
+            array('key' => 'width', 'name' => 'Width', 'is_required' => false, 'type' => 'number', 'group' => 'Shipping', 'sort_order' => 140),
+            array('key' => 'height', 'name' => 'Height', 'is_required' => false, 'type' => 'number', 'group' => 'Shipping', 'sort_order' => 150)
+        );
+    }
+
+    private function categoryResponseFields($attribute_ids, $language_id) {
+        $fields = $this->baseProductFields();
+        $attribute_ids = array_values(array_unique(array_map('intval', $attribute_ids)));
+
+        if (!count($attribute_ids)) {
+            return $fields;
+        }
+
+        $sql_ids = implode(',', $attribute_ids);
+        $attribute_sql = "SELECT a.attribute_id, ad.name, agd.name AS group_name
+                          FROM `" . DB_PREFIX . "attribute` a
+                          LEFT JOIN `" . DB_PREFIX . "attribute_description` ad
+                              ON (a.attribute_id = ad.attribute_id AND ad.language_id = " . (int)$language_id . ")
+                          LEFT JOIN `" . DB_PREFIX . "attribute_group_description` agd
+                              ON (a.attribute_group_id = agd.attribute_group_id AND agd.language_id = " . (int)$language_id . ")
+                          WHERE a.attribute_id IN (" . $sql_ids . ")
+                          ORDER BY a.sort_order ASC, ad.name ASC";
+
+        foreach ($this->db->query($attribute_sql)->rows as $row) {
+            $fields[] = array(
+                'key' => 'attr:' . $row['attribute_id'],
+                'name' => $row['name'],
+                'is_required' => false,
+                'type' => 'string',
+                'group' => $row['group_name'] ? 'Attributes: ' . $row['group_name'] : 'Attributes',
+                'sort_order' => 1000 + (int)$row['attribute_id']
+            );
+        }
+
+        return $fields;
+    }
+
+    private function getCategoryNameMap($language_id) {
+        $rows = $this->db->query("SELECT c.category_id, c.parent_id, cd.name
+            FROM `" . DB_PREFIX . "category` c
+            LEFT JOIN `" . DB_PREFIX . "category_description` cd
+                ON (c.category_id = cd.category_id AND cd.language_id = " . (int)$language_id . ")")->rows;
+
+        $map = array();
+        foreach ($rows as $row) {
+            $map[(int)$row['category_id']] = array(
+                'name' => $row['name'],
+                'parent_id' => (int)$row['parent_id']
+            );
+        }
+
+        return $map;
+    }
+
+    private function buildCategoryPath($category_id, $map) {
+        $parts = array();
+        $guard = 0;
+
+        while ($category_id > 0 && isset($map[$category_id]) && $guard++ < 50) {
+            array_unshift($parts, $map[$category_id]['name']);
+            $category_id = (int)$map[$category_id]['parent_id'];
+        }
+
+        return implode(' / ', $parts);
+    }
+
+    private function countCategoryChildren($category_id) {
+        $query = $this->db->query("SELECT COUNT(*) AS total FROM `" . DB_PREFIX . "category` WHERE status = 1 AND parent_id = " . (int)$category_id);
+        return (int)$query->row['total'];
+    }
+
+    private function readJsonBody() {
+        $raw = file_get_contents('php://input');
+        if (!$raw) {
+            return array();
+        }
+
+        $data = json_decode($raw, true);
+        if (!is_array($data)) {
+            throw new \Exception('Invalid JSON body');
+        }
+
+        return $data;
+    }
+
+    private function json($data, $status = 200) {
+        $this->setStatus($status);
+        $this->response->addHeader('Content-Type: application/json; charset=utf-8');
+        $this->response->setOutput(json_encode($data, JSON_UNESCAPED_UNICODE));
+    }
+
+    private function jsonError($message, $status = 400, $details = array()) {
+        $this->json(array(
+            'success' => false,
+            'error' => $message,
+            'message' => $message,
+            'details' => $details
+        ), $status);
+    }
+
+    private function setStatus($status) {
+        $messages = array(
+            200 => 'OK',
+            400 => 'Bad Request',
+            401 => 'Unauthorized',
+            403 => 'Forbidden',
+            404 => 'Not Found',
+            500 => 'Internal Server Error'
+        );
+
+        $protocol = isset($this->request->server['SERVER_PROTOCOL']) ? $this->request->server['SERVER_PROTOCOL'] : 'HTTP/1.1';
+        $text = isset($messages[$status]) ? $messages[$status] : 'Error';
+        $this->response->addHeader($protocol . ' ' . (int)$status . ' ' . $text);
+    }
+
+    private function getProvidedApiKey() {
+        $server = $this->request->server;
+
+        if (isset($server['HTTP_X_DELEGAT_API_KEY'])) {
+            return trim($server['HTTP_X_DELEGAT_API_KEY']);
+        }
+
+        if (isset($server['HTTP_AUTHORIZATION']) && preg_match('/Bearer\s+(.+)/i', $server['HTTP_AUTHORIZATION'], $matches)) {
+            return trim($matches[1]);
+        }
+
+        if (isset($server['REDIRECT_HTTP_AUTHORIZATION']) && preg_match('/Bearer\s+(.+)/i', $server['REDIRECT_HTTP_AUTHORIZATION'], $matches)) {
+            return trim($matches[1]);
+        }
+
+        return '';
+    }
+
+    private function parseAllowedIps($value) {
+        $lines = preg_split('/\r\n|\r|\n/', $value);
+        $ips = array();
+
+        foreach ($lines as $line) {
+            $line = trim($line);
+            if ($line !== '') {
+                $ips[] = $line;
+            }
+        }
+
+        return $ips;
+    }
+
+    private function getDefaultStoreId() {
+        $value = $this->config->get('module_delegat_bridge_default_store_id');
+        return $value === null || $value === '' ? 0 : (int)$value;
+    }
+
+    private function getDefaultLanguageId() {
+        $value = $this->config->get('module_delegat_bridge_default_language_id');
+        return $value === null || $value === '' ? (int)$this->config->get('config_language_id') : (int)$value;
+    }
+
+    private function value($array, $key, $default = null) {
+        return array_key_exists($key, $array) && $array[$key] !== null ? $array[$key] : $default;
+    }
+}

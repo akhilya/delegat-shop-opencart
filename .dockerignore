@@ -1,0 +1,7 @@
+*
+!Dockerfile
+!docker-entrypoint.sh
+!enable-bridge.php
+!rewrite-site-url.php
+!extension
+!extension/**

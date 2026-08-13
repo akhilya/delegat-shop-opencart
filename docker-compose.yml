@@ -1,0 +1,59 @@
+name: delegat-shop-opencart
+
+# OpenCart 4 + vendored Delegat Bridge.
+# Local: docker compose up -d --build   (first time)
+# Dokploy: same compose + Environment + Domains UI (do not add Traefik labels).
+
+services:
+  db:
+    image: mariadb:11.4
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: ${MYSQL_DATABASE:-opencart}
+      MARIADB_USER: ${MYSQL_USER:-opencart}
+      MARIADB_PASSWORD: ${MYSQL_PASSWORD:-opencart}
+      MARIADB_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-opencart}
+    volumes:
+      - oc_db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  opencart:
+    image: ghcr.io/akhilya/delegat-shop-opencart:${SHOP_IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${PUBLISH_PORT:-8089}:80"
+    environment:
+      DB_HOSTNAME: db
+      DB_USERNAME: ${MYSQL_USER:-opencart}
+      DB_PASSWORD: ${MYSQL_PASSWORD:-opencart}
+      DB_DATABASE: ${MYSQL_DATABASE:-opencart}
+      DB_PORT: "3306"
+      DB_PREFIX: oc_
+      OPENCART_USERNAME: ${OPENCART_USERNAME:-admin}
+      OPENCART_PASSWORD: ${OPENCART_PASSWORD:-admin}
+      OPENCART_EMAIL: ${OPENCART_EMAIL:-admin@example.com}
+      SITE_URL: ${SITE_URL:-http://localhost:8089/}
+      BRIDGE_API_KEY: ${BRIDGE_API_KEY:-delegat-oc-sandbox-api-key-local}
+    volumes:
+      - oc_html:/var/www/html
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1/index.php"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+
+volumes:
+  oc_db:
+  oc_html:
