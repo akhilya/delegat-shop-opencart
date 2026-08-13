@@ -19,6 +19,13 @@ In this folder:
 docker compose up -d --build
 ```
 
+Or use the published image (no local build):
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
 `--build` is needed the first time (and after you change the shop files). The first build can take a few minutes. Watch progress:
 
 ```bash
