@@ -55,11 +55,34 @@ if ($instExists->num_rows === 0) {
         $mysqli,
         "INSERT INTO `{$extInstallTable}` SET `extension_id` = 0, `extension_download_id` = 0, `name` = '{$instName}', `code` = 'delegat_bridge', `version` = '{$instVer}', `author` = '{$instAuthor}', `link` = '{$instLink}', `status` = 1, `date_added` = NOW()"
     );
+    $installId = (int) $mysqli->insert_id;
 } else {
+    $instRow = $instExists->fetch_assoc();
+    $installId = (int) ($instRow['extension_install_id'] ?? 0);
     q(
         $mysqli,
-        "UPDATE `{$extInstallTable}` SET `name` = '{$instName}', `version` = '{$instVer}', `author` = '{$instAuthor}', `link` = '{$instLink}', `status` = 1 WHERE `code` = 'delegat_bridge'"
+        "UPDATE `{$extInstallTable}` SET `name` = '{$instName}', `version` = '{$instVer}', `author` = '{$instAuthor}', `link` = '{$instLink}', `status` = 1 WHERE `extension_install_id` = {$installId}"
     );
+}
+
+$extPathTable = $prefix . 'extension_path';
+q($mysqli, "DELETE FROM `{$extPathTable}` WHERE `extension_install_id` = {$installId} OR `path` LIKE 'delegat_bridge/%'");
+$bridgeRoot = '/var/www/html/extension/delegat_bridge';
+if (is_dir($bridgeRoot)) {
+    $iter = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($bridgeRoot, FilesystemIterator::SKIP_DOTS)
+    );
+    foreach ($iter as $fileInfo) {
+        if (!$fileInfo->isFile()) {
+            continue;
+        }
+        $rel = ltrim(str_replace('\\', '/', substr($fileInfo->getPathname(), strlen($bridgeRoot))), '/');
+        if ($rel === '') {
+            continue;
+        }
+        $pathVal = $mysqli->real_escape_string('delegat_bridge/' . $rel);
+        q($mysqli, "INSERT INTO `{$extPathTable}` SET `extension_install_id` = {$installId}, `path` = '{$pathVal}'");
+    }
 }
 
 $extTable = $prefix . 'extension';
