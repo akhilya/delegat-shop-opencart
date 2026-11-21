@@ -52,6 +52,32 @@ class Delegat extends \Opencart\System\Engine\Controller {
                     $this->json($this->bulkStocks($payload));
                     return;
 
+                case 'orders':
+                    $this->json($this->orders());
+                    return;
+
+                case 'order':
+                    $this->json($this->order());
+                    return;
+
+                case 'orders.status':
+                case 'orders_status':
+                    $this->json($this->updateOrderStatus($payload));
+                    return;
+
+                case 'promotions':
+                    $this->json($this->promotions());
+                    return;
+
+                case 'promotion':
+                    $this->json($this->promotion());
+                    return;
+
+                case 'promotions.products':
+                case 'promotions_products':
+                    $this->json($this->updatePromotionProducts($payload));
+                    return;
+
                 default:
                     $this->jsonError('Unknown action: ' . $action, 404);
                     return;
@@ -95,7 +121,7 @@ class Delegat extends \Opencart\System\Engine\Controller {
         return array(
             'store_name' => $this->config->get('config_name'),
             'version' => defined('VERSION') ? VERSION : '',
-            'api_version' => '1.0.0',
+            'api_version' => '1.3.0',
             'store_id' => $this->getDefaultStoreId(),
             'language_id' => $this->getDefaultLanguageId(),
             'capabilities' => array(
@@ -107,7 +133,13 @@ class Delegat extends \Opencart\System\Engine\Controller {
                 'products.bulk',
                 'prices.bulk',
                 'stocks.bulk',
-                'image.download'
+                'image.download',
+                'orders',
+                'order',
+                'orders.status',
+                'promotions',
+                'promotion',
+                'promotions.products'
             )
         );
     }
@@ -1365,6 +1397,413 @@ class Delegat extends \Opencart\System\Engine\Controller {
     private function getDefaultLanguageId() {
         $value = $this->config->get('module_delegat_bridge_default_language_id');
         return $value === null || $value === '' ? (int)$this->config->get('config_language_id') : (int)$value;
+    }
+
+    private function orders() {
+        $page_size = isset($this->request->get['page_size']) ? (int)$this->request->get['page_size'] : 50;
+        if ($page_size < 1) {
+            $page_size = 50;
+        }
+        if ($page_size > 100) {
+            $page_size = 100;
+        }
+
+        $cursor = isset($this->request->get['cursor']) && $this->request->get['cursor'] !== ''
+            ? (int)$this->request->get['cursor']
+            : 0;
+        $status_filter = isset($this->request->get['status']) ? strtolower(trim((string)$this->request->get['status'])) : '';
+        $language_id = $this->getDefaultLanguageId();
+
+        $sql = "SELECT o.*, os.name AS status_name
+                FROM `" . DB_PREFIX . "order` o
+                LEFT JOIN `" . DB_PREFIX . "order_status` os
+                    ON (o.order_status_id = os.order_status_id AND os.language_id = " . (int)$language_id . ")
+                WHERE o.order_status_id > 0";
+
+        if ($cursor > 0) {
+            $sql .= " AND o.order_id < " . (int)$cursor;
+        }
+
+        $sql .= " ORDER BY o.order_id DESC LIMIT " . (int)($page_size + 1);
+        $rows = $this->db->query($sql)->rows;
+
+        $has_more = count($rows) > $page_size;
+        if ($has_more) {
+            $rows = array_slice($rows, 0, $page_size);
+        }
+
+        $items = array();
+        $last_id = null;
+        foreach ($rows as $row) {
+            $last_id = (int)$row['order_id'];
+            $mapped = $this->mapOrderRow($row);
+            if ($status_filter !== '' && $mapped['status'] !== $status_filter) {
+                continue;
+            }
+            $items[] = $mapped;
+        }
+
+        return array(
+            'items' => $items,
+            'has_more' => $has_more,
+            'next_cursor' => $has_more && $last_id !== null ? (string)$last_id : null
+        );
+    }
+
+    private function order() {
+        $order_id = isset($this->request->get['order_id']) ? (int)$this->request->get['order_id'] : 0;
+        if ($order_id <= 0) {
+            $this->jsonError('order_id is required', 400);
+            exit;
+        }
+
+        $row = $this->loadOrderRow($order_id);
+        if (!$row) {
+            $this->jsonError('Order not found', 404);
+            exit;
+        }
+
+        return $this->mapOrderRow($row);
+    }
+
+    private function updateOrderStatus($payload) {
+        $order_id = isset($payload['order_id']) ? (int)$payload['order_id'] : (isset($payload['orderId']) ? (int)$payload['orderId'] : 0);
+        $action = isset($payload['action']) ? trim((string)$payload['action']) : '';
+        $reason = isset($payload['reason']) ? trim((string)$payload['reason']) : '';
+
+        if ($order_id <= 0 || $action === '') {
+            return array(
+                'success' => false,
+                'order' => null,
+                'error' => 'order_id and action are required'
+            );
+        }
+
+        $existing = $this->loadOrderRow($order_id);
+        if (!$existing) {
+            return array(
+                'success' => false,
+                'order' => null,
+                'error' => 'Order not found: ' . $order_id
+            );
+        }
+
+        $status_id = $this->resolveOrderStatusId($action);
+        if ($status_id <= 0) {
+            return array(
+                'success' => false,
+                'order' => null,
+                'error' => 'Unsupported order status action: ' . $action
+            );
+        }
+
+        $this->db->query("UPDATE `" . DB_PREFIX . "order`
+            SET order_status_id = " . (int)$status_id . ", date_modified = NOW()
+            WHERE order_id = " . (int)$order_id);
+
+        $this->db->query("INSERT INTO `" . DB_PREFIX . "order_history`
+            SET order_id = " . (int)$order_id . ",
+                order_status_id = " . (int)$status_id . ",
+                notify = 0,
+                comment = '" . $this->db->escape($reason) . "',
+                date_added = NOW()");
+
+        $updated = $this->loadOrderRow($order_id);
+
+        return array(
+            'success' => true,
+            'order' => $updated ? $this->mapOrderRow($updated) : null,
+            'error' => null
+        );
+    }
+
+    private function promotions() {
+        $rows = $this->db->query("SELECT * FROM `" . DB_PREFIX . "coupon` ORDER BY coupon_id DESC")->rows;
+        $items = array();
+        foreach ($rows as $row) {
+            $items[] = $this->mapPromotionRow($row);
+        }
+
+        return array('items' => $items);
+    }
+
+    private function promotion() {
+        $promotion_id = isset($this->request->get['promotion_id']) ? (int)$this->request->get['promotion_id'] : 0;
+        if ($promotion_id <= 0) {
+            $this->jsonError('promotion_id is required', 400);
+            exit;
+        }
+
+        $row = $this->loadCouponRow($promotion_id);
+        if (!$row) {
+            $this->jsonError('Promotion not found', 404);
+            exit;
+        }
+
+        return $this->mapPromotionRow($row);
+    }
+
+    private function updatePromotionProducts($payload) {
+        $coupon_id = isset($payload['promotion_id'])
+            ? (int)$payload['promotion_id']
+            : (isset($payload['promotionId']) ? (int)$payload['promotionId'] : 0);
+
+        if ($coupon_id <= 0) {
+            return array(
+                'success' => false,
+                'added' => 0,
+                'removed' => 0,
+                'promotion' => null,
+                'error' => 'promotion_id is required'
+            );
+        }
+
+        $coupon = $this->loadCouponRow($coupon_id);
+        if (!$coupon) {
+            return array(
+                'success' => false,
+                'added' => 0,
+                'removed' => 0,
+                'promotion' => null,
+                'error' => 'Promotion not found: ' . $coupon_id
+            );
+        }
+
+        $remove_all = !empty($payload['remove_all']) || !empty($payload['removeAll']);
+        $remove_ids = array();
+        $raw_remove = isset($payload['remove_external_product_ids'])
+            ? $payload['remove_external_product_ids']
+            : (isset($payload['removeExternalProductIds']) ? $payload['removeExternalProductIds'] : array());
+        if (is_array($raw_remove)) {
+            foreach ($raw_remove as $id) {
+                $pid = (int)$id;
+                if ($pid > 0) {
+                    $remove_ids[$pid] = $pid;
+                }
+            }
+        }
+
+        $add_ids = array();
+        $raw_add = isset($payload['add']) && is_array($payload['add']) ? $payload['add'] : array();
+        foreach ($raw_add as $entry) {
+            if (is_array($entry)) {
+                $val = isset($entry['external_product_id'])
+                    ? $entry['external_product_id']
+                    : (isset($entry['externalProductId']) ? $entry['externalProductId'] : (isset($entry['product_id']) ? $entry['product_id'] : 0));
+                $pid = (int)$val;
+            } else {
+                $pid = (int)$entry;
+            }
+            if ($pid > 0) {
+                $add_ids[$pid] = $pid;
+            }
+        }
+
+        $existing_rows = $this->db->query("SELECT product_id FROM `" . DB_PREFIX . "coupon_product` WHERE coupon_id = " . (int)$coupon_id)->rows;
+        $existing_ids = array();
+        foreach ($existing_rows as $r) {
+            $existing_ids[(int)$r['product_id']] = true;
+        }
+
+        $removed = 0;
+        $added = 0;
+
+        if ($remove_all) {
+            $removed = count($existing_ids);
+            $this->db->query("DELETE FROM `" . DB_PREFIX . "coupon_product` WHERE coupon_id = " . (int)$coupon_id);
+            $existing_ids = array();
+        } elseif (!empty($remove_ids)) {
+            foreach ($remove_ids as $pid) {
+                if (isset($existing_ids[$pid])) {
+                    $this->db->query("DELETE FROM `" . DB_PREFIX . "coupon_product` WHERE coupon_id = " . (int)$coupon_id . " AND product_id = " . (int)$pid);
+                    unset($existing_ids[$pid]);
+                    $removed++;
+                }
+            }
+        }
+
+        foreach ($add_ids as $pid) {
+            if (!isset($existing_ids[$pid])) {
+                $this->db->query("INSERT INTO `" . DB_PREFIX . "coupon_product` SET coupon_id = " . (int)$coupon_id . ", product_id = " . (int)$pid);
+                $existing_ids[$pid] = true;
+                $added++;
+            }
+        }
+
+        $updated = $this->loadCouponRow($coupon_id);
+
+        return array(
+            'success' => true,
+            'added' => $added,
+            'removed' => $removed,
+            'promotion' => $updated ? $this->mapPromotionRow($updated) : null,
+            'error' => null
+        );
+    }
+
+    private function loadOrderRow($order_id) {
+        $language_id = $this->getDefaultLanguageId();
+        $query = $this->db->query("SELECT o.*, os.name AS status_name
+            FROM `" . DB_PREFIX . "order` o
+            LEFT JOIN `" . DB_PREFIX . "order_status` os
+                ON (o.order_status_id = os.order_status_id AND os.language_id = " . (int)$language_id . ")
+            WHERE o.order_id = " . (int)$order_id . "
+            LIMIT 1");
+
+        return $query->num_rows ? $query->row : null;
+    }
+
+    private function mapOrderRow($row) {
+        $order_id = (int)$row['order_id'];
+        $raw_status = isset($row['status_name']) && $row['status_name'] !== ''
+            ? (string)$row['status_name']
+            : (string)$row['order_status_id'];
+
+        $item_rows = $this->db->query("SELECT op.product_id, op.name, op.model, op.quantity, op.price, p.sku
+            FROM `" . DB_PREFIX . "order_product` op
+            LEFT JOIN `" . DB_PREFIX . "product` p ON (op.product_id = p.product_id)
+            WHERE op.order_id = " . (int)$order_id . "
+            ORDER BY op.order_product_id ASC")->rows;
+
+        $items = array();
+        foreach ($item_rows as $ir) {
+            $sku = isset($ir['sku']) && $ir['sku'] !== '' ? (string)$ir['sku'] : (string)$ir['model'];
+            $items[] = array(
+                'external_product_id' => (string)$ir['product_id'],
+                'sku' => $sku,
+                'name' => (string)$ir['name'],
+                'quantity' => (int)$ir['quantity'],
+                'price' => (float)$ir['price'],
+                'discounted_price' => null
+            );
+        }
+
+        $customer_name = trim((isset($row['firstname']) ? $row['firstname'] : '') . ' ' . (isset($row['lastname']) ? $row['lastname'] : ''));
+        $address_parts = array();
+        foreach (array('shipping_country', 'shipping_zone', 'shipping_postcode', 'shipping_city', 'shipping_address_1', 'shipping_address_2') as $field) {
+            if (!empty($row[$field])) {
+                $address_parts[] = trim((string)$row[$field]);
+            }
+        }
+
+        return array(
+            'external_id' => (string)$order_id,
+            'display_id' => '#' . $order_id,
+            'status' => $this->normalizeOrderStatus($raw_status),
+            'raw_status' => $raw_status,
+            'channel' => 'shop',
+            'created_at' => !empty($row['date_added']) ? (string)$row['date_added'] : null,
+            'updated_at' => !empty($row['date_modified']) ? (string)$row['date_modified'] : null,
+            'currency' => !empty($row['currency_code']) ? (string)$row['currency_code'] : 'RUB',
+            'total' => isset($row['total']) ? (float)$row['total'] : 0.0,
+            'customer_name' => $customer_name !== '' ? $customer_name : null,
+            'customer_phone' => !empty($row['telephone']) ? (string)$row['telephone'] : null,
+            'customer_email' => !empty($row['email']) ? (string)$row['email'] : null,
+            'shipping_address' => !empty($address_parts) ? implode(', ', $address_parts) : null,
+            'comment' => !empty($row['comment']) ? (string)$row['comment'] : null,
+            'items' => $items
+        );
+    }
+
+    private function normalizeOrderStatus($raw_status) {
+        $s = strtolower(trim((string)$raw_status));
+        if ($s === '' || $s === 'pending' || $s === 'new') {
+            return 'new';
+        }
+        if (strpos($s, 'process') !== false || strpos($s, 'confirm') !== false || strpos($s, 'pack') !== false) {
+            return 'processing';
+        }
+        if (strpos($s, 'ship') !== false || strpos($s, 'delivering') !== false) {
+            return 'shipped';
+        }
+        if (strpos($s, 'complete') !== false || strpos($s, 'deliver') !== false) {
+            return 'delivered';
+        }
+        if (strpos($s, 'cancel') !== false || strpos($s, 'void') !== false || strpos($s, 'denied') !== false || strpos($s, 'fail') !== false || strpos($s, 'expired') !== false) {
+            return 'cancelled';
+        }
+        if (strpos($s, 'refund') !== false || strpos($s, 'return') !== false || strpos($s, 'reversed') !== false || strpos($s, 'chargeback') !== false) {
+            return 'returned';
+        }
+        return 'unknown';
+    }
+
+    private function resolveOrderStatusId($action) {
+        if (ctype_digit($action)) {
+            $id = (int)$action;
+            $check = $this->db->query("SELECT order_status_id FROM `" . DB_PREFIX . "order_status` WHERE order_status_id = " . $id . " LIMIT 1");
+            return $check->num_rows ? $id : 0;
+        }
+
+        $normalized = strtolower(trim($action));
+        $candidates = array();
+        if (in_array($normalized, array('confirm', 'processing', 'pack', 'assemble', 'accept'), true)) {
+            $candidates = array('Processing', 'Processed');
+        } elseif (in_array($normalized, array('ship', 'shipped', 'delivering'), true)) {
+            $candidates = array('Shipped');
+        } elseif (in_array($normalized, array('complete', 'completed', 'deliver', 'delivered'), true)) {
+            $candidates = array('Complete', 'Delivered');
+        } elseif (in_array($normalized, array('cancel', 'canceled', 'cancelled'), true)) {
+            $candidates = array('Canceled', 'Cancelled', 'Voided');
+        } elseif (in_array($normalized, array('refund', 'refunded', 'return', 'returned'), true)) {
+            $candidates = array('Refunded', 'Reversed');
+        } elseif (in_array($normalized, array('pending', 'new'), true)) {
+            $candidates = array('Pending');
+        } else {
+            $candidates = array($action);
+        }
+
+        $language_id = $this->getDefaultLanguageId();
+        foreach ($candidates as $name) {
+            $q = $this->db->query("SELECT order_status_id FROM `" . DB_PREFIX . "order_status`
+                WHERE language_id = " . (int)$language_id . " AND LOWER(name) = '" . $this->db->escape(strtolower($name)) . "'
+                LIMIT 1");
+            if ($q->num_rows) {
+                return (int)$q->row['order_status_id'];
+            }
+        }
+
+        foreach ($candidates as $name) {
+            $q = $this->db->query("SELECT order_status_id FROM `" . DB_PREFIX . "order_status`
+                WHERE LOWER(name) LIKE '%" . $this->db->escape(strtolower($name)) . "%'
+                LIMIT 1");
+            if ($q->num_rows) {
+                return (int)$q->row['order_status_id'];
+            }
+        }
+
+        return 0;
+    }
+
+    private function loadCouponRow($coupon_id) {
+        $query = $this->db->query("SELECT * FROM `" . DB_PREFIX . "coupon` WHERE coupon_id = " . (int)$coupon_id . " LIMIT 1");
+        return $query->num_rows ? $query->row : null;
+    }
+
+    private function mapPromotionRow($row) {
+        $coupon_id = (int)$row['coupon_id'];
+        $prod_rows = $this->db->query("SELECT product_id FROM `" . DB_PREFIX . "coupon_product` WHERE coupon_id = " . (int)$coupon_id . " ORDER BY product_id ASC")->rows;
+        $product_ids = array();
+        foreach ($prod_rows as $pr) {
+            $product_ids[] = (string)$pr['product_id'];
+        }
+
+        $starts_at = !empty($row['date_start']) && $row['date_start'] !== '0000-00-00' ? (string)$row['date_start'] : null;
+        $ends_at = !empty($row['date_end']) && $row['date_end'] !== '0000-00-00' ? (string)$row['date_end'] : null;
+        $is_percent = isset($row['type']) && strtoupper((string)$row['type']) === 'P';
+
+        return array(
+            'external_id' => (string)$coupon_id,
+            'name' => !empty($row['name']) ? (string)$row['name'] : (string)$row['code'],
+            'type' => 'coupon',
+            'status' => !empty($row['status']) ? 'active' : 'inactive',
+            'starts_at' => $starts_at,
+            'ends_at' => $ends_at,
+            'discount_percent' => $is_percent ? (float)$row['discount'] : null,
+            'discount_amount' => !$is_percent ? (float)$row['discount'] : null,
+            'product_ids' => $product_ids,
+            'description' => !empty($row['code']) ? 'Code: ' . (string)$row['code'] : null
+        );
     }
 
     private function value($array, $key, $default = null) {

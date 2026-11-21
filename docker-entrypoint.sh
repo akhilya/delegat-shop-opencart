@@ -66,6 +66,7 @@ if [ "$installed" -eq 0 ]; then
 fi
 
 echo "Installing Delegat Bridge files..."
+rm -rf /var/www/html/extension/delegat_bridge
 mkdir -p /var/www/html/extension/delegat_bridge
 cp -a /usr/src/delegat_bridge/. /var/www/html/extension/delegat_bridge/
 
