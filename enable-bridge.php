@@ -26,10 +26,48 @@ function q(mysqli $db, string $sql): mysqli_result|bool
     return $res;
 }
 
+$installMeta = [
+    'name' => 'Delegat Bridge',
+    'version' => '1.3.0',
+    'author' => 'Delegat',
+    'link' => 'https://delegat.pro',
+];
+$installJsonPath = '/var/www/html/extension/delegat_bridge/install.json';
+if (is_file($installJsonPath)) {
+    $parsed = json_decode((string) file_get_contents($installJsonPath), true);
+    if (is_array($parsed)) {
+        foreach (['name', 'version', 'author', 'link'] as $field) {
+            if (!empty($parsed[$field]) && is_string($parsed[$field])) {
+                $installMeta[$field] = $parsed[$field];
+            }
+        }
+    }
+}
+
+$extInstallTable = $prefix . 'extension_install';
+$instName = $mysqli->real_escape_string($installMeta['name']);
+$instVer = $mysqli->real_escape_string($installMeta['version']);
+$instAuthor = $mysqli->real_escape_string($installMeta['author']);
+$instLink = $mysqli->real_escape_string($installMeta['link']);
+$instExists = q($mysqli, "SELECT extension_install_id FROM `{$extInstallTable}` WHERE `code` = 'delegat_bridge' LIMIT 1");
+if ($instExists->num_rows === 0) {
+    q(
+        $mysqli,
+        "INSERT INTO `{$extInstallTable}` SET `extension_id` = 0, `extension_download_id` = 0, `name` = '{$instName}', `code` = 'delegat_bridge', `version` = '{$instVer}', `author` = '{$instAuthor}', `link` = '{$instLink}', `status` = 1, `date_added` = NOW()"
+    );
+} else {
+    q(
+        $mysqli,
+        "UPDATE `{$extInstallTable}` SET `name` = '{$instName}', `version` = '{$instVer}', `author` = '{$instAuthor}', `link` = '{$instLink}', `status` = 1 WHERE `code` = 'delegat_bridge'"
+    );
+}
+
 $extTable = $prefix . 'extension';
 $exists = q($mysqli, "SELECT extension_id FROM `{$extTable}` WHERE `type` = 'module' AND `code` = 'delegat_bridge' LIMIT 1");
 if ($exists->num_rows === 0) {
     q($mysqli, "INSERT INTO `{$extTable}` SET `extension` = 'delegat_bridge', `type` = 'module', `code` = 'delegat_bridge'");
+} else {
+    q($mysqli, "UPDATE `{$extTable}` SET `extension` = 'delegat_bridge' WHERE `type` = 'module' AND `code` = 'delegat_bridge'");
 }
 
 $setting = $prefix . 'setting';
@@ -41,13 +79,14 @@ $pairs = [
     'module_delegat_bridge_default_language_id' => '1',
 ];
 
+$envApiKeyProvided = getenv('BRIDGE_API_KEY') !== false && trim((string) getenv('BRIDGE_API_KEY')) !== '';
 foreach ($pairs as $key => $value) {
     $k = $mysqli->real_escape_string($key);
     $v = $mysqli->real_escape_string($value);
-    $found = q($mysqli, "SELECT setting_id FROM `{$setting}` WHERE `code` = 'module_delegat_bridge' AND `key` = '{$k}' LIMIT 1");
+    $found = q($mysqli, "SELECT setting_id, `value` FROM `{$setting}` WHERE `code` = 'module_delegat_bridge' AND `key` = '{$k}' LIMIT 1");
     if ($found->num_rows === 0) {
         q($mysqli, "INSERT INTO `{$setting}` SET `store_id` = 0, `code` = 'module_delegat_bridge', `key` = '{$k}', `value` = '{$v}', `serialized` = 0");
-    } else {
+    } elseif ($key === 'module_delegat_bridge_status' || ($key === 'module_delegat_bridge_api_key' && $envApiKeyProvided)) {
         q($mysqli, "UPDATE `{$setting}` SET `value` = '{$v}', `serialized` = 0 WHERE `code` = 'module_delegat_bridge' AND `key` = '{$k}'");
     }
 }
