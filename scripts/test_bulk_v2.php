@@ -112,7 +112,7 @@ namespace {
                 return $result;
             }
 
-            if (preg_match('/^SELECT product_id FROM `oc_product` WHERE `(sku|model)` = \'((?:[^\'\\\\]|\\\\.)*)\'$/', $sql, $m)) {
+            if (preg_match('/^SELECT product_id FROM `oc_product` WHERE BINARY `(sku|model)` = \'((?:[^\'\\\\]|\\\\.)*)\'$/', $sql, $m)) {
                 $rows = [];
                 foreach ($this->products as $pid => $p) {
                     if (($p[$m[1]] ?? null) === stripcslashes($m[2])) {

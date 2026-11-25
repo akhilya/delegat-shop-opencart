@@ -495,12 +495,11 @@ class Delegat extends \Opencart\System\Engine\Controller {
         // unfiltered readback would compare the written special against
         // another customer group's row and produce false mismatches.
         $special_customer_group_id = $this->getSpecialCustomerGroupId();
-        $sql = "SELECT
-                    p.product_id,
-                    p.model,
-                    " . $sku_select . " AS sku,
-                    p.price,
-                    (
+        // OpenCart 4.1 dropped product_special in favor of product_discount:
+        // probing the table once keeps the catalog listing readable on those
+        // shops instead of failing every page with an unknown-table error.
+        $special_select = $this->tableExists('product_special')
+            ? "(
                         SELECT ps.price
                         FROM `" . DB_PREFIX . "product_special` ps
                         WHERE ps.product_id = p.product_id
@@ -509,7 +508,14 @@ class Delegat extends \Opencart\System\Engine\Controller {
                           AND (ps.date_end = '0000-00-00' OR ps.date_end >= NOW())
                         ORDER BY ps.priority ASC, ps.price ASC
                         LIMIT 1
-                    ) AS special_price,
+                    )"
+            : "NULL";
+        $sql = "SELECT
+                    p.product_id,
+                    p.model,
+                    " . $sku_select . " AS sku,
+                    p.price,
+                    " . $special_select . " AS special_price,
                     p.quantity,
                     p.image,
                     pd.name,
@@ -779,11 +785,18 @@ class Delegat extends \Opencart\System\Engine\Controller {
             $id_kind = 'model';
             $identity = (string)$item['model'];
         } elseif (isset($item['external_product_id']) && trim((string)$item['external_product_id']) !== '') {
-            $identity = (string)$item['external_product_id'];
+            $identity = trim((string)$item['external_product_id']);
             $raw_kind = isset($item['id_kind']) ? strtolower(trim((string)$item['id_kind'])) : '';
             if (in_array($raw_kind, array('product_id', 'sku', 'model'), true)) {
                 $id_kind = $raw_kind;
+            } elseif ($raw_kind !== '') {
+                // An explicit but unknown id_kind must not silently degrade into
+                // the legacy numeric-id interpretation: a numeric SKU would then
+                // write the product with that numeric id instead of failing.
+                return array(0, 'invalid_id_kind', 'Unknown id_kind: ' . $raw_kind . ' (expected product_id, sku, or model)');
             }
+        } else {
+            $identity = trim($identity);
         }
 
         if ($identity === '') {
@@ -837,7 +850,11 @@ class Delegat extends \Opencart\System\Engine\Controller {
 
         $matched = array();
         foreach ($columns as $column) {
-            $rows = $this->db->query("SELECT product_id FROM `" . DB_PREFIX . "product` WHERE `" . $column . "` = '" . $this->db->escape($identity) . "'")->rows;
+            // BINARY forces the exact-match semantics the contract promises:
+            // MySQL default collations are case-insensitive, which would either
+            // merge distinct products differing only by case into a false
+            // ambiguity or update a near-match casing variant.
+            $rows = $this->db->query("SELECT product_id FROM `" . DB_PREFIX . "product` WHERE BINARY `" . $column . "` = '" . $this->db->escape($identity) . "'")->rows;
             foreach ($rows as $row) {
                 $matched[(int)$row['product_id']] = true;
             }
@@ -1410,6 +1427,14 @@ class Delegat extends \Opencart\System\Engine\Controller {
         if (!$this->tableColumnExists($table, $column)) {
             $this->db->query("ALTER TABLE `" . DB_PREFIX . $this->db->escape($table) . "` ADD COLUMN " . $definition);
         }
+    }
+
+    private function tableExists($table) {
+        static $cache = array();
+        if (!array_key_exists($table, $cache)) {
+            $cache[$table] = count($this->db->query("SHOW TABLES LIKE '" . $this->db->escape(DB_PREFIX . $table) . "'")->rows) > 0;
+        }
+        return $cache[$table];
     }
 
     private function tableColumnExists($table, $column) {
