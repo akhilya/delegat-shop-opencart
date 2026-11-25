@@ -597,17 +597,22 @@ class Delegat extends \Opencart\System\Engine\Controller {
                 continue;
             }
 
-            list($product_id, $resolve_error, $resolve_message) = $this->resolveBulkRowProductId($item);
-            if ($product_id <= 0) {
-                $results[] = $this->bulkRowFailure($index, $verbatim, $resolve_error, $resolve_message);
-                continue;
-            }
-
-            // The base price write and the special delete/insert are one
-            // logical row write: they commit atomically or not at all, so a
-            // mid-row failure can never leave a base price without its
-            // intended special (or vice versa) behind.
+            // Identity lookup is inside the same Throwable containment as the
+            // write: a database error while resolving an alias must fail only
+            // this row and must never abort the whole bulk response after
+            // earlier rows already committed.
+            $product_id = null;
             try {
+                list($product_id, $resolve_error, $resolve_message) = $this->resolveBulkRowProductId($item);
+                if ($product_id <= 0) {
+                    $results[] = $this->bulkRowFailure($index, $verbatim, $resolve_error, $resolve_message);
+                    continue;
+                }
+
+                // The base price write and the special delete/insert are one
+                // logical row write: they commit atomically or not at all, so a
+                // mid-row failure can never leave a base price without its
+                // intended special (or vice versa) behind.
                 $this->db->query("START TRANSACTION");
                 try {
                     if ($has_price) {
@@ -693,13 +698,17 @@ class Delegat extends \Opencart\System\Engine\Controller {
                 continue;
             }
 
-            list($product_id, $resolve_error, $resolve_message) = $this->resolveBulkRowProductId($item);
-            if ($product_id <= 0) {
-                $results[] = $this->bulkRowFailure($index, $verbatim, $resolve_error, $resolve_message);
-                continue;
-            }
-
+            // As in prices/bulk, alias lookup failures are contained to this
+            // row: one bad storage engine read cannot take down the response
+            // for rows before or after it.
+            $product_id = null;
             try {
+                list($product_id, $resolve_error, $resolve_message) = $this->resolveBulkRowProductId($item);
+                if ($product_id <= 0) {
+                    $results[] = $this->bulkRowFailure($index, $verbatim, $resolve_error, $resolve_message);
+                    continue;
+                }
+
                 // Single-statement row write: inherently atomic, no explicit
                 // transaction needed (unlike price/card graph rows).
                 $this->db->query("UPDATE `" . DB_PREFIX . "product` SET quantity = " . (int)$quantity . ", date_modified = NOW() WHERE product_id = " . (int)$product_id);
@@ -785,7 +794,12 @@ class Delegat extends \Opencart\System\Engine\Controller {
             $id_kind = 'model';
             $identity = (string)$item['model'];
         } elseif (isset($item['external_product_id']) && trim((string)$item['external_product_id']) !== '') {
-            $identity = trim((string)$item['external_product_id']);
+            // Keep the identity byte-for-byte for alias matching: leading or
+            // trailing whitespace is significant in a stored SKU/model, and
+            // trimming here would retarget the row onto the unpadded product.
+            // The numeric-product-id legacy path below trims its own copy so
+            // v1-style padded numeric ids keep their historic behavior.
+            $identity = (string)$item['external_product_id'];
             $raw_kind = isset($item['id_kind']) ? strtolower(trim((string)$item['id_kind'])) : '';
             if (in_array($raw_kind, array('product_id', 'sku', 'model'), true)) {
                 $id_kind = $raw_kind;
@@ -804,10 +818,11 @@ class Delegat extends \Opencart\System\Engine\Controller {
         }
 
         if ($id_kind === 'product_id') {
-            if (!ctype_digit($identity) || (int)$identity <= 0) {
+            $numeric_identity = trim($identity);
+            if (!ctype_digit($numeric_identity) || (int)$numeric_identity <= 0) {
                 return array(0, 'invalid_product_id', 'product_id identity must be a positive integer, got: ' . $identity);
             }
-            $product_id = (int)$identity;
+            $product_id = (int)$numeric_identity;
             if (!$this->productExists($product_id)) {
                 return array(0, 'product_not_found', 'Product not found: ' . $identity);
             }
@@ -818,9 +833,13 @@ class Delegat extends \Opencart\System\Engine\Controller {
             return $this->resolveProductIdByExactAlias($id_kind, $identity);
         }
 
-        // Legacy default for a bare external_product_id.
-        if (ctype_digit($identity) && (int)$identity > 0) {
-            $product_id = (int)$identity;
+        // Legacy default for a bare external_product_id. v1 cast the value to
+        // int, so surrounding whitespace remains compatible on the numeric-id
+        // path; non-numeric aliases stay verbatim because whitespace is part
+        // of the exact alias value.
+        $numeric_identity = trim($identity);
+        if (ctype_digit($numeric_identity) && (int)$numeric_identity > 0) {
+            $product_id = (int)$numeric_identity;
             if (!$this->productExists($product_id)) {
                 return array(0, 'product_not_found', 'Product not found: ' . $identity);
             }
@@ -1432,7 +1451,11 @@ class Delegat extends \Opencart\System\Engine\Controller {
     private function tableExists($table) {
         static $cache = array();
         if (!array_key_exists($table, $cache)) {
-            $cache[$table] = count($this->db->query("SHOW TABLES LIKE '" . $this->db->escape(DB_PREFIX . $table) . "'")->rows) > 0;
+            // Exact equality in information_schema: SHOW TABLES LIKE treats
+            // underscores as wildcards, which can confuse a same-shaped table
+            // from another shop prefix in a shared database with the exact
+            // table this installation uses.
+            $cache[$table] = count($this->db->query("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '" . $this->db->escape(DB_PREFIX . $table) . "'")->rows) > 0;
         }
         return $cache[$table];
     }

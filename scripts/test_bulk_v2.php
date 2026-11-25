@@ -53,7 +53,9 @@ namespace {
         public array $existingColumns = ['sku' => true, 'model' => true, 'variant' => true];
         public int $lastId = 0;
         public ?string $failOnPattern = null;   // regex; first matching write throws
+        public ?string $failOnSelectPattern = null; // regex; first matching read throws
         public bool $failOnce = true;
+        public array $existingTables = ['product_special' => true];
         private ?array $txSnapshot = null;
 
         public function escape($v): string {
@@ -88,11 +90,26 @@ namespace {
                 return $result;
             }
 
+            if ($this->failOnSelectPattern !== null && preg_match($this->failOnSelectPattern, $sql) && stripos($sql, 'SELECT') === 0) {
+                if ($this->failOnce) {
+                    $this->failOnSelectPattern = null;
+                }
+                throw new \Exception('simulated read failure');
+            }
+
             if ($this->failOnPattern !== null && preg_match($this->failOnPattern, $sql) && stripos($sql, 'SELECT') !== 0) {
                 if ($this->failOnce) {
                     $this->failOnPattern = null;
                 }
                 throw new \Exception('simulated write failure');
+            }
+
+            if (preg_match('/^SELECT TABLE_NAME FROM information_schema\.TABLES WHERE TABLE_SCHEMA = DATABASE\(\) AND TABLE_NAME = \'oc_(\w+)\'$/', $sql, $m)) {
+                if (!empty($this->existingTables[$m[1]])) {
+                    $result->rows = [['TABLE_NAME' => 'oc_' . $m[1]]];
+                    $result->num_rows = 1;
+                }
+                return $result;
             }
 
             if (preg_match('/^SHOW COLUMNS FROM `oc_(\w+)` LIKE \'(\w+)\'/', $sql, $m)) {
@@ -157,7 +174,7 @@ namespace {
                 $id = 1;
                 foreach (array_keys($this->products) as $k) { $id = max($id, (int)$k + 1); }
                 $row = ['product_id' => $id, 'sku' => '', 'model' => '', 'price' => 0.0, 'quantity' => 0];
-                if (preg_match_all("/(\w+) = '((?:[^'\\]|\\.)*)'/", $m[1], $mm, PREG_SET_ORDER)) {
+                if (preg_match_all("/(\w+) = '((?:[^'\\\\]|\\\\.)*)'/", $m[1], $mm, PREG_SET_ORDER)) {
                     foreach ($mm as $pair) {
                         $row[$pair[1]] = stripcslashes($pair[2]);
                     }
@@ -169,7 +186,7 @@ namespace {
 
             if (preg_match('/^UPDATE `oc_product` SET (.*?) WHERE product_id = (\d+)/s', $sql, $m)) {
                 $pid = (int)$m[2];
-                if (isset($this->products[$pid]) && preg_match_all("/(\w+) = '((?:[^'\\]|\\.)*)'/", $m[1], $mm, PREG_SET_ORDER)) {
+                if (isset($this->products[$pid]) && preg_match_all("/(\w+) = '((?:[^'\\\\]|\\\\.)*)'/", $m[1], $mm, PREG_SET_ORDER)) {
                     foreach ($mm as $pair) {
                         if ($pair[1] !== 'date_modified') {
                             $this->products[$pid][$pair[1]] = stripcslashes($pair[2]);
@@ -214,6 +231,11 @@ namespace {
             $m = new \ReflectionMethod(Delegat::class, $method);
             $m->setAccessible(true);
             return $m->invokeArgs($this, $payload === [] ? [] : [$payload]);
+        }
+        public function callPrivateArgs(string $method, array $args) {
+            $m = new \ReflectionMethod(Delegat::class, $method);
+            $m->setAccessible(true);
+            return $m->invokeArgs($this, $args);
         }
         public function callHealth() {
             return $this->callPrivate('health');
@@ -313,6 +335,49 @@ namespace {
     check('prices: bare numeric id keeps legacy product-id semantics',
         ($resp['items'][0]['resolved_product_id'] ?? null) === 1000);
 
+    // Whitespace is significant for exact aliases, while the legacy numeric-id
+    // path keeps the old int-cast tolerance for padded digits.
+    $db = new FakeDb();
+    $db->products = [
+        42 => ['product_id' => 42, 'sku' => ' A-42', 'model' => 'M-42', 'price' => 10.0, 'quantity' => 5],
+        81 => ['product_id' => 81, 'sku' => 'A-42', 'model' => 'M-81', 'price' => 20.0, 'quantity' => 3],
+    ];
+    $c = makeController($db);
+    $resp = $c->callPrivate('bulkPrices', ['items' => [
+        ['external_product_id' => ' A-42', 'id_kind' => 'sku', 'price' => 44.0],
+    ]]);
+    check('prices: padded sku matches only the verbatim padded alias',
+        ($resp['items'][0]['resolved_product_id'] ?? null) === 42
+        && abs($db->products[42]['price'] - 44.0) < 0.0001
+        && abs($db->products[81]['price'] - 20.0) < 0.0001,
+        json_encode([$resp['items'][0] ?? null, $db->products]));
+    $resp = $c->callPrivate('bulkPrices', ['items' => [
+        ['external_product_id' => ' 42 ', 'price' => 45.0],
+    ]]);
+    check('prices: padded bare numeric id keeps legacy product-id compatibility',
+        ($resp['items'][0]['resolved_product_id'] ?? null) === 42);
+
+    // An alias lookup storage failure is contained to its own row; the next
+    // row still resolves and writes, and the response remains per-row v2.
+    $db = new FakeDb();
+    $db->products = [
+        42 => ['product_id' => 42, 'sku' => 'SKU-42', 'model' => 'M-42', 'price' => 10.0, 'quantity' => 5],
+        43 => ['product_id' => 43, 'sku' => 'SKU-43', 'model' => 'M-43', 'price' => 20.0, 'quantity' => 3],
+    ];
+    $db->failOnSelectPattern = '/BINARY `sku`/';
+    $c = makeController($db);
+    $resp = $c->callPrivate('bulkPrices', ['items' => [
+        ['external_product_id' => 'SKU-42', 'id_kind' => 'sku', 'price' => 50.0],
+        ['external_product_id' => '43', 'price' => 51.0],
+    ]]);
+    check('prices: lookup exception is row-contained write_failed',
+        count($resp['items'] ?? []) === 2
+        && ($resp['items'][0]['success'] ?? null) === false
+        && ($resp['items'][0]['error_code'] ?? '') === 'write_failed'
+        && ($resp['items'][1]['success'] ?? null) === true,
+        json_encode($resp['items'] ?? []));
+    check('prices: later row still writes after lookup exception', abs($db->products[43]['price'] - 51.0) < 0.0001);
+
     // ambiguity: two products share one sku -> row failure, no write
     $db = new FakeDb();
     $db->products = [
@@ -387,11 +452,30 @@ namespace {
     check('stocks: missing quantity rejected instead of zeroing stock',
         ($items[3]['success'] ?? null) === false && ($items[3]['error_code'] ?? '') === 'invalid_quantity');
 
+    $db = new FakeDb();
+    $db->products = [
+        42 => ['product_id' => 42, 'sku' => 'SKU-42', 'model' => 'M-42', 'price' => 1.0, 'quantity' => 5],
+        43 => ['product_id' => 43, 'sku' => 'SKU-43', 'model' => 'M-43', 'price' => 1.0, 'quantity' => 3],
+    ];
+    $db->failOnSelectPattern = '/BINARY `sku`/';
+    $c = makeController($db);
+    $resp = $c->callPrivate('bulkStocks', ['items' => [
+        ['external_product_id' => 'SKU-42', 'id_kind' => 'sku', 'quantity' => 9],
+        ['external_product_id' => '43', 'quantity' => 8],
+    ]]);
+    check('stocks: lookup exception is row-contained and later rows continue',
+        count($resp['items'] ?? []) === 2
+        && ($resp['items'][0]['error_code'] ?? '') === 'write_failed'
+        && ($resp['items'][1]['success'] ?? null) === true
+        && $db->products[43]['quantity'] === 8
+        && $db->products[42]['quantity'] === 5,
+        json_encode([$resp['items'] ?? [], $db->products]));
+
     // ---------- products/bulk: explicit index, per-row containment ----------
     $db = new FakeDb();
     $c = makeController($db);
     $resp = $c->callPrivate('bulkProducts', ['items' => [
-        ['local_product_id' => 101, 'product' => ['name' => 'A', 'model' => 'A-1']],
+        ['local_product_id' => 101, 'product' => ['name' => 'A', 'model' => 'A-1', 'sku' => 'SKU-A-1']],
         ['local_product_id' => 102, 'product' => ['model' => 'NO-NAME']],
     ]]);
     $items = $resp['items'];
@@ -401,8 +485,21 @@ namespace {
 "; }
     check('cards: valid row succeeds with product id',
         ($items[0]['success'] ?? null) === true && !empty($items[0]['product_id']));
+    $createdCard = $db->products[(int)($items[0]['product_id'] ?? 0)] ?? null;
+    check('cards: SQL field parser preserves model and sku verbatim',
+        is_array($createdCard) && ($createdCard['model'] ?? '') === 'A-1' && ($createdCard['sku'] ?? '') === 'SKU-A-1',
+        json_encode($createdCard));
     check('cards: invalid row fails at its own index without stopping the batch',
         ($items[1]['success'] ?? null) === false && isset($items[1]['error_message']));
+
+    // ---------- exact table detection ----------
+    $db = new FakeDb();
+    $c = makeController($db);
+    check('tableExists uses exact information_schema equality',
+        $c->callPrivateArgs('tableExists', ['product_special']) === true
+        && count(array_filter($db->log, fn($s) => stripos($s, 'SHOW TABLES LIKE') !== false)) === 0
+        && count(array_filter($db->log, fn($s) => stripos($s, "TABLE_NAME = 'oc_product_special'") !== false)) === 1,
+        json_encode($db->log));
 
     // ---------- ceiling ----------
     $db = new FakeDb();

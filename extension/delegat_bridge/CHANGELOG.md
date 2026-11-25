@@ -53,6 +53,17 @@ All notable changes to the Delegat Bridge OpenCart extension.
   `local_product_id`, keeping positional attribution even when local ids repeat.
 - `api_version` reported by `health` is now `1.4.0`.
 
+### Fixed
+
+- Exact SKU/model resolution preserves whitespace-significant aliases verbatim,
+  while a bare padded numeric `external_product_id` keeps the legacy product-id
+  behavior that existing price/stock clients rely on.
+- Database failures during alias lookup are contained to their own price/stock
+  row instead of aborting the whole bulk response after earlier rows committed.
+- Internal table detection uses exact `information_schema` equality instead of
+  `SHOW TABLES LIKE`, whose underscore wildcards could confuse similarly named
+  tables in shared databases.
+
 ## [1.3.0] - 2026-09-01
 
 ### Added
