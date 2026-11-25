@@ -82,12 +82,28 @@ class Delegat extends \Opencart\System\Engine\Controller {
                     $this->jsonError('Unknown action: ' . $action, 404);
                     return;
             }
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
+            // \Throwable, not \Exception: a PHP type error or fatal-ish \Error
+            // inside one bulk row must surface as a structured 500 instead of
+            // an unparseable white page, so the client can treat the whole
+            // request as ambiguous and reconcile instead of blindly replaying.
+            $this->rollbackQuietly();
             $this->jsonError($e->getMessage(), 500, array(
                 'exception' => get_class($e),
                 'file' => $e->getFile(),
                 'line' => $e->getLine()
             ));
+        }
+    }
+
+    // Best-effort rollback for the catastrophic path: if a Throwable escaped
+    // a row-level transaction the connection would otherwise hold the partial
+    // graph open until request end. A failed rollback (dead connection, no
+    // open transaction) is itself swallowed - the response is already a 500.
+    private function rollbackQuietly() {
+        try {
+            $this->db->query("ROLLBACK");
+        } catch (\Throwable $ignored) {
         }
     }
 
@@ -121,7 +137,7 @@ class Delegat extends \Opencart\System\Engine\Controller {
         return array(
             'store_name' => $this->config->get('config_name'),
             'version' => defined('VERSION') ? VERSION : '',
-            'api_version' => '1.3.0',
+            'api_version' => '1.4.0',
             'store_id' => $this->getDefaultStoreId(),
             'language_id' => $this->getDefaultLanguageId(),
             'capabilities' => array(
@@ -140,6 +156,32 @@ class Delegat extends \Opencart\System\Engine\Controller {
                 'promotions',
                 'promotion',
                 'promotions.products'
+            ),
+            // Structured feature detection for bulk clients. The legacy flat
+            // capabilities array cannot express behavioral contracts, so
+            // batching clients gate on these flags instead of api_version
+            // string parsing:
+            // - bulk.v2.per_row_results: prices/stocks/products bulk responses
+            //   carry items[] exactly parallel to the input rows, each with
+            //   the input index, the verbatim pre-cast external_product_id,
+            //   the resolved numeric product id and per-row success/error.
+            // - bulk.alias_resolution: prices/stocks rows resolve product_id,
+            //   sku or model exact-match server-side (id_kind or distinct
+            //   fields); zero or several matches fail the row, never an
+            //   arbitrary LIMIT-1 pick.
+            // - bulk.per_row_transactions: every price row (base price plus
+            //   special delete/insert) and every card row (the whole product
+            //   graph) commits or rolls back atomically.
+            // - stocks.warehouse_reject: a stock row carrying warehouse_id is
+            //   rejected row-level instead of silently writing global quantity.
+            // - bulk.max_rows: rows beyond this per-request ceiling fail
+            //   row-level with too_many_rows; earlier rows still apply.
+            'capability_details' => array(
+                'bulk.v2.per_row_results' => true,
+                'bulk.alias_resolution' => true,
+                'bulk.per_row_transactions' => true,
+                'stocks.warehouse_reject' => true,
+                'bulk.max_rows' => 500
             )
         );
     }
@@ -319,21 +361,41 @@ class Delegat extends \Opencart\System\Engine\Controller {
 
     private function upsertProduct($payload) {
         $product = isset($payload['product']) && is_array($payload['product']) ? $payload['product'] : $payload;
+
+        // Image downloads are network I/O bounded by the remote server's
+        // latency: they run BEFORE the database transaction opens, so a slow
+        // or failing download never holds row locks on the product graph.
+        // Orphaned image files from a later-rolled-back write are harmless.
+        $preloaded_images = $this->preDownloadProductImages(
+            isset($product['image_urls']) && is_array($product['image_urls']) ? $product['image_urls'] : array());
+
         $product_id = $this->resolveProductId($product);
 
-        if ($product_id > 0) {
-            $this->updateProduct($product_id, $product);
-        } else {
-            $product_id = $this->createProduct($product);
-        }
+        // The whole product graph - base row, descriptions, store and category
+        // links, attributes, options, image rows, special price - is one
+        // logical write: it commits atomically or rolls back completely, so a
+        // failure midway never leaves a half-written card behind.
+        $this->db->query("START TRANSACTION");
+        try {
+            if ($product_id > 0) {
+                $this->updateProduct($product_id, $product);
+            } else {
+                $product_id = $this->createProduct($product);
+            }
 
-        $this->saveProductDescriptions($product_id, $product);
-        $this->saveProductStore($product_id, $product);
-        $this->saveProductCategories($product_id, $product);
-        $this->saveProductAttributes($product_id, $product);
-        $this->saveProductOptions($product_id, $product);
-        $image_result = $this->saveProductImages($product_id, $product);
-        $this->saveProductSpecial($product_id, $product);
+            $this->saveProductDescriptions($product_id, $product);
+            $this->saveProductStore($product_id, $product);
+            $this->saveProductCategories($product_id, $product);
+            $this->saveProductAttributes($product_id, $product);
+            $this->saveProductOptions($product_id, $product);
+            $image_result = $this->saveProductImages($product_id, $product, $preloaded_images);
+            $this->saveProductSpecial($product_id, $product);
+
+            $this->db->query("COMMIT");
+        } catch (\Throwable $write_error) {
+            $this->rollbackQuietly();
+            throw $write_error;
+        }
 
         return array(
             'success' => true,
@@ -346,10 +408,13 @@ class Delegat extends \Opencart\System\Engine\Controller {
     }
 
     private function bulkProducts($payload) {
-        $items = isset($payload['items']) && is_array($payload['items']) ? $payload['items'] : array();
+        $items = isset($payload['items']) && is_array($payload['items']) ? array_values($payload['items']) : array();
         $results = array();
 
-        foreach ($items as $item) {
+        foreach ($items as $index => $item) {
+            if (!is_array($item)) {
+                $item = array();
+            }
             $local_product_id = isset($item['local_product_id']) ? (int)$item['local_product_id'] : 0;
             $product = isset($item['product']) && is_array($item['product']) ? $item['product'] : array();
 
@@ -357,18 +422,36 @@ class Delegat extends \Opencart\System\Engine\Controller {
                 $product['product_id'] = $item['existing_external_id'];
             }
 
+            if ($index >= self::BULK_MAX_ROWS) {
+                $results[] = array(
+                    'index' => $index,
+                    'local_product_id' => $local_product_id,
+                    'success' => false,
+                    'error_code' => 'too_many_rows',
+                    'error_message' => 'Row exceeds the per-request ceiling of ' . self::BULK_MAX_ROWS . ' rows (bulk.max_rows); chunk the request and replay the tail'
+                );
+                continue;
+            }
+
+            // \Throwable containment per row: every input row produces exactly
+            // one result row at its own input index, even when the failure is
+            // a PHP error rather than a catchable exception. Each row's graph
+            // is transactional inside upsertProduct, so rows stay independent.
             try {
                 $result = $this->upsertProduct($product);
                 $results[] = array(
+                    'index' => $index,
                     'local_product_id' => $local_product_id,
                     'success' => true,
                     'product_id' => $result['product_id'],
                     'details' => isset($result['details']) ? $result['details'] : null
                 );
-            } catch (\Exception $e) {
+            } catch (\Throwable $e) {
                 $results[] = array(
+                    'index' => $index,
                     'local_product_id' => $local_product_id,
                     'success' => false,
+                    'error_code' => 'write_failed',
                     'error_message' => $e->getMessage()
                 );
             }
@@ -407,11 +490,26 @@ class Delegat extends \Opencart\System\Engine\Controller {
             $where .= " OR pd.name LIKE '%" . $escaped . "%')";
         }
 
+        // Special price readback mirrors the write path exactly: the same
+        // customer group the write uses, same validity window semantics. An
+        // unfiltered readback would compare the written special against
+        // another customer group's row and produce false mismatches.
+        $special_customer_group_id = $this->getSpecialCustomerGroupId();
         $sql = "SELECT
                     p.product_id,
                     p.model,
                     " . $sku_select . " AS sku,
                     p.price,
+                    (
+                        SELECT ps.price
+                        FROM `" . DB_PREFIX . "product_special` ps
+                        WHERE ps.product_id = p.product_id
+                          AND ps.customer_group_id = " . (int)$special_customer_group_id . "
+                          AND (ps.date_start = '0000-00-00' OR ps.date_start <= NOW())
+                          AND (ps.date_end = '0000-00-00' OR ps.date_end >= NOW())
+                        ORDER BY ps.priority ASC, ps.price ASC
+                        LIMIT 1
+                    ) AS special_price,
                     p.quantity,
                     p.image,
                     pd.name,
@@ -447,6 +545,7 @@ class Delegat extends \Opencart\System\Engine\Controller {
                 'name' => isset($row['name']) ? (string)$row['name'] : '',
                 'description' => isset($row['description']) ? (string)$row['description'] : '',
                 'price' => isset($row['price']) ? (float)$row['price'] : null,
+                'special_price' => isset($row['special_price']) && $row['special_price'] !== null ? (float)$row['special_price'] : null,
                 'quantity' => isset($row['quantity']) ? (int)$row['quantity'] : null,
                 'category_id' => isset($row['category_id']) ? (string)$row['category_id'] : null,
                 'category_name' => isset($row['category_name']) ? (string)$row['category_name'] : null,
@@ -461,65 +560,296 @@ class Delegat extends \Opencart\System\Engine\Controller {
         );
     }
 
+    // Rows beyond this per-request ceiling fail row-level with too_many_rows
+    // while earlier rows still apply. The value is published as the
+    // bulk.max_rows capability detail so clients can chunk correctly.
+    private const BULK_MAX_ROWS = 500;
+
     private function bulkPrices($payload) {
-        $items = isset($payload['items']) && is_array($payload['items']) ? $payload['items'] : array();
+        $items = isset($payload['items']) && is_array($payload['items']) ? array_values($payload['items']) : array();
         $errors = array();
+        $results = array();
         $success = 0;
 
-        foreach ($items as $item) {
-            $product_id = isset($item['external_product_id']) ? (int)$item['external_product_id'] : 0;
-            if ($product_id <= 0 || !$this->productExists($product_id)) {
-                $errors[] = array('external_id' => (string)$product_id, 'message' => 'Product not found');
+        foreach ($items as $index => $item) {
+            if (!is_array($item)) {
+                $item = array();
+            }
+            $verbatim = $this->rowVerbatimIdentity($item);
+
+            if ($index >= self::BULK_MAX_ROWS) {
+                $results[] = $this->bulkRowFailure($index, $verbatim, 'too_many_rows',
+                    'Row exceeds the per-request ceiling of ' . self::BULK_MAX_ROWS . ' rows (bulk.max_rows); chunk the request and replay the tail');
                 continue;
             }
 
-            $updates = array();
-            if (array_key_exists('price', $item) && $item['price'] !== null) {
-                $updates[] = "price = '" . (float)$item['price'] . "'";
+            $has_price = array_key_exists('price', $item) && $item['price'] !== null;
+            $has_special = array_key_exists('special_price', $item) && $item['special_price'] !== null;
+
+            if (($has_price && (float)$item['price'] < 0) || ($has_special && (float)$item['special_price'] < 0)) {
+                $results[] = $this->bulkRowFailure($index, $verbatim, 'invalid_price', 'Price values cannot be negative');
+                continue;
             }
 
-            if ($updates) {
-                $this->db->query("UPDATE `" . DB_PREFIX . "product` SET " . implode(', ', $updates) . ", date_modified = NOW() WHERE product_id = " . (int)$product_id);
+            list($product_id, $resolve_error, $resolve_message) = $this->resolveBulkRowProductId($item);
+            if ($product_id <= 0) {
+                $results[] = $this->bulkRowFailure($index, $verbatim, $resolve_error, $resolve_message);
+                continue;
             }
 
-            if (array_key_exists('special_price', $item) && $item['special_price'] !== null) {
-                $this->replaceSpecialPrice($product_id, (float)$item['special_price']);
-            }
+            // The base price write and the special delete/insert are one
+            // logical row write: they commit atomically or not at all, so a
+            // mid-row failure can never leave a base price without its
+            // intended special (or vice versa) behind.
+            try {
+                $this->db->query("START TRANSACTION");
+                try {
+                    if ($has_price) {
+                        $this->db->query("UPDATE `" . DB_PREFIX . "product` SET price = '" . (float)$item['price'] . "', date_modified = NOW() WHERE product_id = " . (int)$product_id);
+                    }
 
-            $success++;
+                    if ($has_special) {
+                        $this->replaceSpecialPrice($product_id, (float)$item['special_price']);
+                    }
+
+                    $this->db->query("COMMIT");
+                } catch (\Throwable $write_error) {
+                    $this->rollbackQuietly();
+                    throw $write_error;
+                }
+
+                $success++;
+                $results[] = array(
+                    'index' => $index,
+                    'external_product_id' => $verbatim,
+                    'resolved_product_id' => $product_id,
+                    'success' => true
+                );
+            } catch (\Throwable $e) {
+                $results[] = $this->bulkRowFailure($index, $verbatim, 'write_failed',
+                    'Price row write failed atomically: ' . $e->getMessage(), $product_id);
+            }
+        }
+
+        foreach ($results as $row) {
+            if (!$row['success']) {
+                $errors[] = array('external_id' => (string)$row['external_product_id'], 'message' => $row['error_message']);
+            }
         }
 
         return array(
             'total_count' => count($items),
             'success_count' => $success,
-            'failed_count' => count($errors),
-            'errors' => $errors
+            'failed_count' => count($items) - $success,
+            'errors' => $errors,
+            'items' => $results
         );
     }
 
     private function bulkStocks($payload) {
-        $items = isset($payload['items']) && is_array($payload['items']) ? $payload['items'] : array();
+        $items = isset($payload['items']) && is_array($payload['items']) ? array_values($payload['items']) : array();
         $errors = array();
+        $results = array();
         $success = 0;
 
-        foreach ($items as $item) {
-            $product_id = isset($item['external_product_id']) ? (int)$item['external_product_id'] : 0;
-            if ($product_id <= 0 || !$this->productExists($product_id)) {
-                $errors[] = array('external_id' => (string)$product_id, 'message' => 'Product not found');
+        foreach ($items as $index => $item) {
+            if (!is_array($item)) {
+                $item = array();
+            }
+            $verbatim = $this->rowVerbatimIdentity($item);
+
+            if ($index >= self::BULK_MAX_ROWS) {
+                $results[] = $this->bulkRowFailure($index, $verbatim, 'too_many_rows',
+                    'Row exceeds the per-request ceiling of ' . self::BULK_MAX_ROWS . ' rows (bulk.max_rows); chunk the request and replay the tail');
                 continue;
             }
 
-            $quantity = isset($item['quantity']) ? (int)$item['quantity'] : 0;
-            $this->db->query("UPDATE `" . DB_PREFIX . "product` SET quantity = " . (int)$quantity . ", date_modified = NOW() WHERE product_id = " . (int)$product_id);
-            $success++;
+            // A warehouse-scoped row must never degrade into a global quantity
+            // write: until the bridge implements real warehouse stock, the row
+            // is rejected where the operator can see it instead of silently
+            // mis-writing the sellable total.
+            if (array_key_exists('warehouse_id', $item) && $item['warehouse_id'] !== null && trim((string)$item['warehouse_id']) !== '') {
+                $results[] = $this->bulkRowFailure($index, $verbatim, 'warehouse_unsupported',
+                    'OpenCart bridge does not support warehouse-scoped stock; the row was not written rather than applied to global quantity');
+                continue;
+            }
+
+            // A missing quantity must never default to zero: silently zeroing
+            // stock is a data-corruption write, not a validation failure the
+            // sender can see. Negative quantities are rejected the same way.
+            if (!array_key_exists('quantity', $item) || $item['quantity'] === null || !is_numeric($item['quantity'])) {
+                $results[] = $this->bulkRowFailure($index, $verbatim, 'invalid_quantity', 'Stock row requires an explicit non-negative numeric quantity');
+                continue;
+            }
+            $quantity = (int)$item['quantity'];
+            if ($quantity < 0 || (float)$item['quantity'] != (float)$quantity) {
+                $results[] = $this->bulkRowFailure($index, $verbatim, 'invalid_quantity', 'Stock row requires a non-negative integer quantity');
+                continue;
+            }
+
+            list($product_id, $resolve_error, $resolve_message) = $this->resolveBulkRowProductId($item);
+            if ($product_id <= 0) {
+                $results[] = $this->bulkRowFailure($index, $verbatim, $resolve_error, $resolve_message);
+                continue;
+            }
+
+            try {
+                // Single-statement row write: inherently atomic, no explicit
+                // transaction needed (unlike price/card graph rows).
+                $this->db->query("UPDATE `" . DB_PREFIX . "product` SET quantity = " . (int)$quantity . ", date_modified = NOW() WHERE product_id = " . (int)$product_id);
+
+                $success++;
+                $results[] = array(
+                    'index' => $index,
+                    'external_product_id' => $verbatim,
+                    'resolved_product_id' => $product_id,
+                    'success' => true
+                );
+            } catch (\Throwable $e) {
+                $results[] = $this->bulkRowFailure($index, $verbatim, 'write_failed',
+                    'Stock row write failed: ' . $e->getMessage(), $product_id);
+            }
+        }
+
+        foreach ($results as $row) {
+            if (!$row['success']) {
+                $errors[] = array('external_id' => (string)$row['external_product_id'], 'message' => $row['error_message']);
+            }
         }
 
         return array(
             'total_count' => count($items),
             'success_count' => $success,
-            'failed_count' => count($errors),
-            'errors' => $errors
+            'failed_count' => count($items) - $success,
+            'errors' => $errors,
+            'items' => $results
         );
+    }
+
+    // The identity string the client actually sent, before any casting: rows
+    // are attributed by input index first, but echoing the verbatim identity
+    // keeps legacy error entries and operator logs meaningful for alias rows
+    // (the v1 int cast destroyed non-numeric identities here).
+    private function rowVerbatimIdentity($item) {
+        foreach (array('external_product_id', 'product_id', 'sku', 'model') as $key) {
+            if (isset($item[$key]) && (string)$item[$key] !== '') {
+                return (string)$item[$key];
+            }
+        }
+        return '';
+    }
+
+    private function bulkRowFailure($index, $verbatim, $error_code, $error_message, $resolved_product_id = null) {
+        return array(
+            'index' => $index,
+            'external_product_id' => $verbatim,
+            'resolved_product_id' => $resolved_product_id !== null ? (int)$resolved_product_id : null,
+            'success' => false,
+            'error_code' => $error_code,
+            'error_message' => $error_message
+        );
+    }
+
+    // Resolves one price/stock row identity to exactly one product id.
+    // Returns array(product_id, error_code, error_message): product_id > 0 on
+    // success, otherwise 0 with a row-level failure reason.
+    //
+    // Identity forms, in precedence order:
+    // 1. Distinct fields: product_id (numeric exact row), sku or model
+    //    (exact-match alias).
+    // 2. external_product_id with an explicit id_kind of product_id/sku/model.
+    // 3. Bare external_product_id (legacy v1-compatible default): numeric
+    //    values are product ids exactly as the v1 int cast treated them;
+    //    non-numeric values resolve by exact sku/model match.
+    // Alias resolution counts distinct product ids across exact matches only:
+    // zero matches is product_not_found, several is product_ambiguous - never
+    // an arbitrary LIMIT-1 pick, and a numeric sku is never confused with a
+    // product id when id_kind says sku.
+    private function resolveBulkRowProductId($item) {
+        $id_kind = '';
+        $identity = '';
+
+        if (isset($item['product_id']) && (string)$item['product_id'] !== '') {
+            $id_kind = 'product_id';
+            $identity = (string)$item['product_id'];
+        } elseif (isset($item['sku']) && trim((string)$item['sku']) !== '') {
+            $id_kind = 'sku';
+            $identity = (string)$item['sku'];
+        } elseif (isset($item['model']) && trim((string)$item['model']) !== '') {
+            $id_kind = 'model';
+            $identity = (string)$item['model'];
+        } elseif (isset($item['external_product_id']) && trim((string)$item['external_product_id']) !== '') {
+            $identity = (string)$item['external_product_id'];
+            $raw_kind = isset($item['id_kind']) ? strtolower(trim((string)$item['id_kind'])) : '';
+            if (in_array($raw_kind, array('product_id', 'sku', 'model'), true)) {
+                $id_kind = $raw_kind;
+            }
+        }
+
+        if ($identity === '') {
+            return array(0, 'identity_missing', 'Row carries no product identity (product_id, sku, model, or external_product_id)');
+        }
+
+        if ($id_kind === 'product_id') {
+            if (!ctype_digit($identity) || (int)$identity <= 0) {
+                return array(0, 'invalid_product_id', 'product_id identity must be a positive integer, got: ' . $identity);
+            }
+            $product_id = (int)$identity;
+            if (!$this->productExists($product_id)) {
+                return array(0, 'product_not_found', 'Product not found: ' . $identity);
+            }
+            return array($product_id, null, null);
+        }
+
+        if ($id_kind === 'sku' || $id_kind === 'model') {
+            return $this->resolveProductIdByExactAlias($id_kind, $identity);
+        }
+
+        // Legacy default for a bare external_product_id.
+        if (ctype_digit($identity) && (int)$identity > 0) {
+            $product_id = (int)$identity;
+            if (!$this->productExists($product_id)) {
+                return array(0, 'product_not_found', 'Product not found: ' . $identity);
+            }
+            return array($product_id, null, null);
+        }
+
+        return $this->resolveProductIdByExactAlias('', $identity);
+    }
+
+    // Exact-match alias resolution over distinct product ids. With an empty
+    // kind both sku and model are probed and a single distinct match across
+    // either resolves; ambiguity in any combination fails the row.
+    private function resolveProductIdByExactAlias($kind, $identity) {
+        $columns = array();
+        if ($kind === 'sku' || $kind === '') {
+            if ($this->tableColumnExists('product', 'sku')) {
+                $columns[] = 'sku';
+            }
+        }
+        if ($kind === 'model' || $kind === '') {
+            $columns[] = 'model';
+        }
+
+        if (!count($columns)) {
+            return array(0, 'product_not_found', 'Product not found by ' . ($kind !== '' ? $kind : 'sku/model') . ': ' . $identity);
+        }
+
+        $matched = array();
+        foreach ($columns as $column) {
+            $rows = $this->db->query("SELECT product_id FROM `" . DB_PREFIX . "product` WHERE `" . $column . "` = '" . $this->db->escape($identity) . "'")->rows;
+            foreach ($rows as $row) {
+                $matched[(int)$row['product_id']] = true;
+            }
+        }
+
+        if (count($matched) === 1) {
+            return array((int)array_key_first($matched), null, null);
+        }
+        if (count($matched) === 0) {
+            return array(0, 'product_not_found', 'Product not found by exact ' . ($kind !== '' ? $kind : 'sku/model') . ' match: ' . $identity);
+        }
+        return array(0, 'product_ambiguous', 'More than one product matches ' . ($kind !== '' ? $kind : 'sku/model') . ' exactly: ' . $identity);
     }
 
     private function createProduct($product) {
@@ -812,25 +1142,44 @@ class Delegat extends \Opencart\System\Engine\Controller {
         }
     }
 
-    private function saveProductImages($product_id, $product) {
-        if (!isset($product['image_urls']) || !is_array($product['image_urls']) || !count($product['image_urls'])) {
-            return array('requested' => 0, 'downloaded' => 0, 'errors' => array());
+    // Network/fs phase of image handling: downloads every reachable URL and
+    // writes the image files, without touching the database. Runs outside the
+    // product-graph transaction so remote latency never holds row locks.
+    private function preDownloadProductImages($image_urls) {
+        $result = array('requested' => count($image_urls), 'paths' => array(), 'errors' => array());
+        if (!count($image_urls)) {
+            return $result;
         }
 
-        $relative_images = array();
-        $errors = array();
-        foreach ($product['image_urls'] as $url) {
+        foreach ($image_urls as $url) {
             $error = '';
             $downloaded = $this->downloadImage((string)$url, $error);
             if ($downloaded) {
-                $relative_images[] = $downloaded;
+                $result['paths'][] = $downloaded;
             } elseif ($error !== '') {
-                $errors[] = array(
+                $result['errors'][] = array(
                     'url' => (string)$url,
                     'message' => $error
                 );
             }
         }
+
+        return $result;
+    }
+
+    // Database phase of image handling: links already-downloaded image files
+    // into the product graph. Runs inside the row transaction so the primary
+    // image, gallery rows and the rest of the graph commit atomically.
+    private function saveProductImages($product_id, $product, $preloaded = null) {
+        if (!isset($product['image_urls']) || !is_array($product['image_urls']) || !count($product['image_urls'])) {
+            return array('requested' => 0, 'downloaded' => 0, 'errors' => array());
+        }
+
+        if ($preloaded === null) {
+            $preloaded = $this->preDownloadProductImages($product['image_urls']);
+        }
+        $relative_images = $preloaded['paths'];
+        $errors = $preloaded['errors'];
 
         if (!count($relative_images)) {
             if (count($errors)) {
@@ -873,11 +1222,16 @@ class Delegat extends \Opencart\System\Engine\Controller {
         $this->replaceSpecialPrice($product_id, (float)$product['special_price']);
     }
 
-    private function replaceSpecialPrice($product_id, $price) {
+    // The customer group special prices are written for - and read back
+    // against. One source of truth shared by the write and the readback so
+    // they can never drift into a false mismatch.
+    private function getSpecialCustomerGroupId() {
         $customer_group_id = (int)$this->config->get('config_customer_group_id');
-        if ($customer_group_id <= 0) {
-            $customer_group_id = 1;
-        }
+        return $customer_group_id > 0 ? $customer_group_id : 1;
+    }
+
+    private function replaceSpecialPrice($product_id, $price) {
+        $customer_group_id = $this->getSpecialCustomerGroupId();
 
         $this->db->query("DELETE FROM `" . DB_PREFIX . "product_special` WHERE product_id = " . (int)$product_id . " AND customer_group_id = " . (int)$customer_group_id);
         $this->db->query("INSERT INTO `" . DB_PREFIX . "product_special` SET
