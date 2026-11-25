@@ -494,7 +494,13 @@ namespace {
 
     // ---------- exact table detection ----------
     $db = new FakeDb();
+    $db->existingTables = []; // only similarly named tables exist in the shared database
     $c = makeController($db);
+    check('tableExists absent case is false for the exact table',
+        $c->callPrivateArgs('tableExists', ['product_special']) === false,
+        json_encode($db->log));
+    $db->existingTables = ['product_special' => true];
+    $db->log = [];
     check('tableExists uses exact information_schema equality',
         $c->callPrivateArgs('tableExists', ['product_special']) === true
         && count(array_filter($db->log, fn($s) => stripos($s, 'SHOW TABLES LIKE') !== false)) === 0

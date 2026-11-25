@@ -1449,15 +1449,12 @@ class Delegat extends \Opencart\System\Engine\Controller {
     }
 
     private function tableExists($table) {
-        static $cache = array();
-        if (!array_key_exists($table, $cache)) {
-            // Exact equality in information_schema: SHOW TABLES LIKE treats
-            // underscores as wildcards, which can confuse a same-shaped table
-            // from another shop prefix in a shared database with the exact
-            // table this installation uses.
-            $cache[$table] = count($this->db->query("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '" . $this->db->escape(DB_PREFIX . $table) . "'")->rows) > 0;
-        }
-        return $cache[$table];
+        // Exact equality in information_schema: SHOW TABLES LIKE treats
+        // underscores as wildcards, which can confuse a same-shaped table
+        // from another shop prefix in a shared database with the exact table
+        // this installation uses. The lookup is cheap and scoped to the rare
+        // schema probe, so correctness is preferred over a static cache.
+        return count($this->db->query("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '" . $this->db->escape(DB_PREFIX . $table) . "'")->rows) > 0;
     }
 
     private function tableColumnExists($table, $column) {
