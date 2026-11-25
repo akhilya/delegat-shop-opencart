@@ -1,6 +1,6 @@
 <?php
 /**
- * Behavioral test harness for the Delegat Bridge bulk v2 contract.
+ * Behavioral test harness for the Delegat Bridge bulk v2 and batch product-read contracts.
  *
  * Stubs the minimal OpenCart framework surface (Controller base class, db,
  * config, request, response) with an in-memory SQL emulation of just the
@@ -49,6 +49,7 @@ namespace {
         public array $products = [];      // product_id => row
         public array $specials = [];      // list of rows
         public array $descriptions = [];
+        public array $productImages = []; // list of product_image rows
         public array $log = [];           // every SQL statement in order
         public array $existingColumns = ['sku' => true, 'model' => true, 'variant' => true];
         public int $lastId = 0;
@@ -57,6 +58,10 @@ namespace {
         public bool $failOnce = true;
         public array $existingTables = ['product_special' => true];
         private ?array $txSnapshot = null;
+
+        private function productIsActive(array $product): bool {
+            return !array_key_exists('status', $product) || (int)$product['status'] === 1;
+        }
 
         public function escape($v): string {
             return str_replace(['\\', "'", "\0", "\n", "\r", "\x1a"], ['\\\\', "\\'", '\\0', '\\n', '\\r', '\\Z'], (string)$v);
@@ -136,6 +141,87 @@ namespace {
                         $rows[] = ['product_id' => $pid];
                     }
                 }
+                $result->rows = $rows;
+                $result->num_rows = count($rows);
+                return $result;
+            }
+
+            // products.batch identity preselection: one OR'ed candidate query.
+            if (preg_match('/^SELECT p\.product_id, p\.model, (p\.sku|\'\') AS sku\s+FROM `oc_product` p\s+WHERE p\.status = 1 AND \((.*)\)$/s', $sql, $m)) {
+                $conditions = $m[2];
+                $ids = [];
+                if (preg_match('/p\.product_id IN \(([\d,]+)\)/', $conditions, $idMatch)) {
+                    $ids = array_map('intval', explode(',', $idMatch[1]));
+                }
+                preg_match_all('/BINARY `(sku|model)` = \'((?:[^\'\\\\]|\\\\.)*)\'/', $conditions, $aliasMatches, PREG_SET_ORDER);
+
+                $rows = [];
+                foreach ($this->products as $pid => $p) {
+                    if (!$this->productIsActive($p)) {
+                        continue;
+                    }
+                    $matched = in_array((int)$pid, $ids, true);
+                    foreach ($aliasMatches as $aliasMatch) {
+                        if (($p[$aliasMatch[1]] ?? null) === stripcslashes($aliasMatch[2])) {
+                            $matched = true;
+                            break;
+                        }
+                    }
+                    if ($matched) {
+                        $rows[] = [
+                            'product_id' => (int)$pid,
+                            'model' => (string)($p['model'] ?? ''),
+                            'sku' => $m[1] === "''" ? '' : (string)($p['sku'] ?? ''),
+                        ];
+                    }
+                }
+                $result->rows = $rows;
+                $result->num_rows = count($rows);
+                return $result;
+            }
+
+            // products.batch payload load: same catalog shape as the paginated listing.
+            if (preg_match('/^SELECT\s+p\.product_id,\s+p\.model,\s+.*?\s+FROM `oc_product` p\s+.*?\s+WHERE p\.status = 1 AND p\.product_id IN \(([\d,]+)\)\s+ORDER BY p\.product_id ASC$/s', $sql, $m)) {
+                $rows = [];
+                foreach (array_map('intval', explode(',', $m[1])) as $pid) {
+                    $p = $this->products[$pid] ?? null;
+                    if (!is_array($p) || !$this->productIsActive($p)) {
+                        continue;
+                    }
+                    $special = null;
+                    foreach ($this->specials as $specialRow) {
+                        if ((int)($specialRow['product_id'] ?? 0) === $pid) {
+                            $special = (float)($specialRow['price'] ?? 0);
+                            break;
+                        }
+                    }
+                    $rows[] = [
+                        'product_id' => $pid,
+                        'model' => (string)($p['model'] ?? ''),
+                        'sku' => (string)($p['sku'] ?? ''),
+                        'price' => (float)($p['price'] ?? 0),
+                        'special_price' => $special,
+                        'quantity' => (int)($p['quantity'] ?? 0),
+                        'image' => (string)($p['image'] ?? ''),
+                        'name' => (string)($p['name'] ?? ''),
+                        'description' => (string)($p['description'] ?? ''),
+                        'category_id' => isset($p['category_id']) ? (int)$p['category_id'] : null,
+                        'category_name' => isset($p['category_name']) ? (string)$p['category_name'] : null,
+                    ];
+                }
+                usort($rows, fn($a, $b) => $a['product_id'] <=> $b['product_id']);
+                $result->rows = $rows;
+                $result->num_rows = count($rows);
+                return $result;
+            }
+
+            if (preg_match('/^SELECT product_id, image FROM `oc_product_image`\s+WHERE product_id IN \(([\d,]+)\)\s+ORDER BY product_id ASC, sort_order ASC, product_image_id ASC$/s', $sql, $m)) {
+                $ids = array_map('intval', explode(',', $m[1]));
+                $rows = array_values(array_filter($this->productImages, fn($row) => in_array((int)$row['product_id'], $ids, true)));
+                usort($rows, function ($a, $b) {
+                    return [$a['product_id'], $a['sort_order'] ?? 0, $a['product_image_id'] ?? 0]
+                        <=> [$b['product_id'], $b['sort_order'] ?? 0, $b['product_image_id'] ?? 0];
+                });
                 $result->rows = $rows;
                 $result->num_rows = count($rows);
                 return $result;
@@ -253,6 +339,7 @@ namespace {
             'module_delegat_bridge_api_key' => 'test-key',
             'config_customer_group_id' => 1,
             'config_name' => 'Test shop',
+            'config_url' => 'https://shop.test/',
         ]);
         $c->request = new FakeRequest();
         $c->response = new FakeResponse();
@@ -276,15 +363,19 @@ namespace {
     $db = new FakeDb();
     $c = makeController($db);
     $health = $c->callHealth();
-    check('health api_version is 1.4.0', ($health['api_version'] ?? '') === '1.4.0');
+    check('health api_version is 1.5.0', ($health['api_version'] ?? '') === '1.5.0');
     $caps = $health['capability_details'] ?? [];
     check('health capability_details complete',
         ($caps['bulk.v2.per_row_results'] ?? null) === true
         && ($caps['bulk.alias_resolution'] ?? null) === true
         && ($caps['bulk.per_row_transactions'] ?? null) === true
         && ($caps['stocks.warehouse_reject'] ?? null) === true
-        && ($caps['bulk.max_rows'] ?? null) === 500);
-    check('health legacy capabilities retained', in_array('prices.bulk', $health['capabilities'] ?? [], true));
+        && ($caps['bulk.max_rows'] ?? null) === 500
+        && ($caps['products.batch'] ?? null) === true
+        && ($caps['products.batch.max_rows'] ?? null) === 500);
+    check('health legacy capabilities retained',
+        in_array('prices.bulk', $health['capabilities'] ?? [], true)
+        && in_array('products.batch', $health['capabilities'] ?? [], true));
 
     // ---------- prices/bulk: per-row results with verbatim identity ----------
     $db = new FakeDb();
@@ -491,6 +582,92 @@ namespace {
         json_encode($createdCard));
     check('cards: invalid row fails at its own index without stopping the batch',
         ($items[1]['success'] ?? null) === false && isset($items[1]['error_message']));
+
+    // ---------- products.batch: exact identity read, per-row presence ----------
+    $db = new FakeDb();
+    $db->products = [
+        42 => ['product_id' => 42, 'sku' => 'SKU-42', 'model' => 'M-42', 'price' => 10.0, 'quantity' => 5, 'status' => 1, 'image' => 'main42.jpg', 'name' => 'Product 42', 'description' => '<p>Forty-two</p>', 'category_id' => 7, 'category_name' => 'Catalog'],
+        43 => ['product_id' => 43, 'sku' => '1000', 'model' => 'M-43', 'price' => 20.0, 'quantity' => 3, 'status' => 1, 'name' => 'Product 43'],
+        44 => ['product_id' => 44, 'sku' => 'case', 'model' => 'M-44', 'price' => 30.0, 'quantity' => 2, 'status' => 1, 'name' => 'Lower case'],
+        45 => ['product_id' => 45, 'sku' => 'CASE', 'model' => 'M-45', 'price' => 40.0, 'quantity' => 1, 'status' => 1, 'name' => 'Upper case'],
+        46 => ['product_id' => 46, 'sku' => ' A-46', 'model' => 'M-46', 'price' => 50.0, 'quantity' => 8, 'status' => 1, 'name' => 'Padded'],
+        47 => ['product_id' => 47, 'sku' => 'A-46', 'model' => 'M-47', 'price' => 60.0, 'quantity' => 9, 'status' => 1, 'name' => 'Unpadded'],
+        48 => ['product_id' => 48, 'sku' => 'DUP', 'model' => 'M-48', 'price' => 1.0, 'quantity' => 1, 'status' => 1],
+        49 => ['product_id' => 49, 'sku' => 'DUP', 'model' => 'M-49', 'price' => 2.0, 'quantity' => 1, 'status' => 1],
+        50 => ['product_id' => 50, 'sku' => 'DISABLED', 'model' => 'M-50', 'price' => 3.0, 'quantity' => 1, 'status' => 0],
+        1000 => ['product_id' => 1000, 'sku' => 'OTHER', 'model' => 'M-1000', 'price' => 4.0, 'quantity' => 1, 'status' => 1],
+    ];
+    $db->specials[] = ['product_id' => 42, 'customer_group_id' => 1, 'priority' => 1, 'price' => 8.5, 'date_start' => '0000-00-00', 'date_end' => '0000-00-00'];
+    $db->productImages[] = ['product_id' => 42, 'image' => 'gallery42.jpg', 'sort_order' => 0, 'product_image_id' => 5];
+    $c = makeController($db);
+    $resp = $c->callPrivate('batchProducts', ['items' => [
+        ['external_product_id' => '42'],
+        ['external_product_id' => 'SKU-42'],
+        ['external_product_id' => '1000', 'id_kind' => 'sku'],
+        ['external_product_id' => 'case', 'id_kind' => 'sku'],
+        ['external_product_id' => ' A-46', 'id_kind' => 'sku'],
+        ['external_product_id' => 'missing', 'id_kind' => 'sku'],
+        ['external_product_id' => 'DUP', 'id_kind' => 'sku'],
+        ['external_product_id' => '42', 'id_kind' => 'weird'],
+        ['external_product_id' => 'DISABLED', 'id_kind' => 'sku'],
+        ['model' => 'M-43'],
+    ]]);
+    $items = $resp['items'] ?? [];
+    check('batch read: one explicit row per input index',
+        count($items) === 10
+        && array_values(array_map(fn($row) => $row['index'] ?? null, $items)) === range(0, 9),
+        json_encode($items));
+    check('batch read: counters reflect found and unresolved rows',
+        ($resp['total_count'] ?? null) === 10 && ($resp['found_count'] ?? null) === 6 && ($resp['unresolved_count'] ?? null) === 4,
+        json_encode(['total' => $resp['total_count'] ?? null, 'found' => $resp['found_count'] ?? null, 'unresolved' => $resp['unresolved_count'] ?? null]));
+    check('batch read: numeric product id row found with verbatim identity',
+        ($items[0]['found'] ?? null) === true && $items[0]['external_product_id'] === '42' && $items[0]['resolved_product_id'] === 42);
+    check('batch read: bare nonnumeric alias resolves exactly',
+        ($items[1]['found'] ?? null) === true && $items[1]['resolved_product_id'] === 42);
+    check('batch read: numeric sku with id_kind resolves sku row, never product id row',
+        ($items[2]['found'] ?? null) === true && $items[2]['resolved_product_id'] === 43);
+    check('batch read: exact sku match is case-sensitive',
+        ($items[3]['found'] ?? null) === true && $items[3]['resolved_product_id'] === 44);
+    check('batch read: exact sku match preserves significant whitespace',
+        ($items[4]['found'] ?? null) === true && $items[4]['resolved_product_id'] === 46 && $items[4]['external_product_id'] === ' A-46');
+    check('batch read: absent alias is explicit product_not_found',
+        ($items[5]['found'] ?? null) === false && ($items[5]['error_code'] ?? '') === 'product_not_found' && ($items[5]['resolved_product_id'] ?? null) === null);
+    check('batch read: duplicate alias is explicit product_ambiguous',
+        ($items[6]['found'] ?? null) === false && ($items[6]['error_code'] ?? '') === 'product_ambiguous');
+    check('batch read: unknown explicit id_kind never degrades namespaces',
+        ($items[7]['found'] ?? null) === false && ($items[7]['error_code'] ?? '') === 'invalid_id_kind');
+    check('batch read: inactive catalog rows stay invisible like the products listing',
+        ($items[8]['found'] ?? null) === false && ($items[8]['error_code'] ?? '') === 'product_not_found');
+    check('batch read: distinct model field resolves exactly',
+        ($items[9]['found'] ?? null) === true && $items[9]['resolved_product_id'] === 43 && $items[9]['external_product_id'] === 'M-43');
+
+    $payload = $items[0]['product'] ?? [];
+    check('batch read: payload matches catalog product shape',
+        ($payload['external_id'] ?? null) === '42'
+        && ($payload['sku'] ?? null) === 'SKU-42'
+        && ($payload['model'] ?? null) === 'M-42'
+        && ($payload['name'] ?? null) === 'Product 42'
+        && ($payload['description'] ?? null) === '<p>Forty-two</p>'
+        && abs(($payload['price'] ?? 0) - 10.0) < 0.0001
+        && abs(($payload['special_price'] ?? 0) - 8.5) < 0.0001
+        && ($payload['quantity'] ?? null) === 5
+        && ($payload['category_id'] ?? null) === '7'
+        && ($payload['category_name'] ?? null) === 'Catalog',
+        json_encode($payload));
+    check('batch read: image urls are batched with primary first',
+        ($payload['image_urls'] ?? null) === ['https://shop.test/image/main42.jpg', 'https://shop.test/image/gallery42.jpg'],
+        json_encode($payload['image_urls'] ?? null));
+
+    $candidateQueries = array_values(array_filter($db->log, fn($sql) => stripos($sql, 'SELECT p.product_id, p.model,') === 0));
+    $payloadQueries = array_values(array_filter($db->log, fn($sql) => stripos($sql, 'product_description') !== false && stripos($sql, 'p.product_id IN (') !== false));
+    $imageQueries = array_values(array_filter($db->log, fn($sql) => stripos($sql, 'SELECT product_id, image FROM `oc_product_image`') === 0));
+    $perRowAliasQueries = array_values(array_filter($db->log, fn($sql) => stripos($sql, 'SELECT product_id FROM `oc_product` WHERE BINARY') === 0));
+    check('batch read: identity resolution is one preselect query, not N alias lookups',
+        count($candidateQueries) === 1 && count($perRowAliasQueries) === 0,
+        json_encode(['candidates' => count($candidateQueries), 'per_row' => count($perRowAliasQueries)]));
+    check('batch read: payload and gallery loads are batched once',
+        count($payloadQueries) === 1 && count($imageQueries) === 1,
+        json_encode(['payload' => count($payloadQueries), 'images' => count($imageQueries)]));
 
     // ---------- exact table detection ----------
     $db = new FakeDb();

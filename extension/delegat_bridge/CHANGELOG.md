@@ -4,6 +4,28 @@ All notable changes to the Delegat Bridge OpenCart extension.
 
 ## [Unreleased]
 
+### Added
+
+- **Batch exact-identity product reads** through `POST action=products.batch`.
+  The request carries `items[]` with the bulk v2 identity forms (`product_id`,
+  `sku`, `model`, or `external_product_id` plus optional `id_kind`). The response
+  carries exactly one row per input `index`: found rows include the same full
+  product payload shape as the paginated `products` listing; unresolved rows are
+  explicit `found=false` with `product_not_found`, `product_ambiguous`,
+  `invalid_id_kind`, `invalid_product_id`, `identity_missing`, or
+  `too_many_rows`. Like the catalog listing, inactive products are not visible.
+- **Batched identity and payload loading** for that endpoint: one SQL candidate
+  preselect, exact byte-for-byte PHP matching (case- and whitespace-significant),
+  one product payload query, and one gallery query per request instead of one
+  filtered catalog scan per product.
+- `health` now advertises `capability_details.products.batch` and
+  `products.batch.max_rows` (500), and the legacy flat capability list includes
+  `products.batch`.
+
+### Changed
+
+- Bridge extension and `health.api_version` are now `1.5.0`.
+
 ## [1.4.0] - 2026-11-25
 
 ### Added

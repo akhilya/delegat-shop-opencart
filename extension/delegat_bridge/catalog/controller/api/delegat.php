@@ -42,6 +42,11 @@ class Delegat extends \Opencart\System\Engine\Controller {
                     $this->json($this->products());
                     return;
 
+                case 'products.batch':
+                case 'products_batch':
+                    $this->json($this->batchProducts($payload));
+                    return;
+
                 case 'prices.bulk':
                 case 'prices_bulk':
                     $this->json($this->bulkPrices($payload));
@@ -137,7 +142,7 @@ class Delegat extends \Opencart\System\Engine\Controller {
         return array(
             'store_name' => $this->config->get('config_name'),
             'version' => defined('VERSION') ? VERSION : '',
-            'api_version' => '1.4.0',
+            'api_version' => '1.5.0',
             'store_id' => $this->getDefaultStoreId(),
             'language_id' => $this->getDefaultLanguageId(),
             'capabilities' => array(
@@ -145,6 +150,7 @@ class Delegat extends \Opencart\System\Engine\Controller {
                 'categories.upsert',
                 'category.fields',
                 'products',
+                'products.batch',
                 'products.upsert',
                 'products.bulk',
                 'prices.bulk',
@@ -176,12 +182,17 @@ class Delegat extends \Opencart\System\Engine\Controller {
             //   rejected row-level instead of silently writing global quantity.
             // - bulk.max_rows: rows beyond this per-request ceiling fail
             //   row-level with too_many_rows; earlier rows still apply.
+            // - products.batch: POST products.batch reads many exact product
+            //   identities in one request and returns one explicit found/missing
+            //   row per input index. products.batch.max_rows is its ceiling.
             'capability_details' => array(
                 'bulk.v2.per_row_results' => true,
                 'bulk.alias_resolution' => true,
                 'bulk.per_row_transactions' => true,
                 'stocks.warehouse_reject' => true,
-                'bulk.max_rows' => 500
+                'bulk.max_rows' => self::BULK_MAX_ROWS,
+                'products.batch' => true,
+                'products.batch.max_rows' => self::BULK_MAX_ROWS
             )
         );
     }
@@ -490,6 +501,35 @@ class Delegat extends \Opencart\System\Engine\Controller {
             $where .= " OR pd.name LIKE '%" . $escaped . "%')";
         }
 
+        $sql = $this->productCatalogSelectSql($language_id, $sku_select)
+                . $where . "
+                ORDER BY p.product_id ASC
+                LIMIT " . (int)$offset . ", " . (int)($limit + 1);
+
+        $rows = $this->db->query($sql)->rows;
+        $has_more = count($rows) > $limit;
+        if ($has_more) {
+            $rows = array_slice($rows, 0, $limit);
+        }
+
+        $items = array();
+        foreach ($rows as $row) {
+            $items[] = $this->productPayloadFromRow(
+                $row,
+                $this->productImageUrls((int)$row['product_id'], isset($row['image']) ? (string)$row['image'] : ''));
+        }
+
+        return array(
+            'items' => $items,
+            'has_more' => $has_more,
+            'next_cursor' => $has_more ? (string)($offset + $limit) : null
+        );
+    }
+
+    // Shared SELECT for catalog product read payloads. The batch lookup must
+    // return exactly the same product shape as the paginated products listing,
+    // including the write-path-compatible special-price readback.
+    private function productCatalogSelectSql($language_id, $sku_select) {
         // Special price readback mirrors the write path exactly: the same
         // customer group the write uses, same validity window semantics. An
         // unfiltered readback would compare the written special against
@@ -510,7 +550,8 @@ class Delegat extends \Opencart\System\Engine\Controller {
                         LIMIT 1
                     )"
             : "NULL";
-        $sql = "SELECT
+
+        return "SELECT
                     p.product_id,
                     p.model,
                     " . $sku_select . " AS sku,
@@ -531,38 +572,317 @@ class Delegat extends \Opencart\System\Engine\Controller {
                     GROUP BY product_id
                 ) pc ON (p.product_id = pc.product_id)
                 LEFT JOIN `" . DB_PREFIX . "category_description` cd
-                    ON (pc.category_id = cd.category_id AND cd.language_id = " . (int)$language_id . ")"
-                . $where . "
-                ORDER BY p.product_id ASC
-                LIMIT " . (int)$offset . ", " . (int)($limit + 1);
+                    ON (pc.category_id = cd.category_id AND cd.language_id = " . (int)$language_id . ")";
+    }
 
-        $rows = $this->db->query($sql)->rows;
-        $has_more = count($rows) > $limit;
-        if ($has_more) {
-            $rows = array_slice($rows, 0, $limit);
+    private function productPayloadFromRow($row, $image_urls) {
+        return array(
+            'external_id' => (string)$row['product_id'],
+            'sku' => $row['sku'] !== '' ? (string)$row['sku'] : (string)$row['model'],
+            'model' => (string)$row['model'],
+            'name' => isset($row['name']) ? (string)$row['name'] : '',
+            'description' => isset($row['description']) ? (string)$row['description'] : '',
+            'price' => isset($row['price']) ? (float)$row['price'] : null,
+            'special_price' => isset($row['special_price']) && $row['special_price'] !== null ? (float)$row['special_price'] : null,
+            'quantity' => isset($row['quantity']) ? (int)$row['quantity'] : null,
+            'category_id' => isset($row['category_id']) ? (string)$row['category_id'] : null,
+            'category_name' => isset($row['category_name']) ? (string)$row['category_name'] : null,
+            'image_urls' => $image_urls
+        );
+    }
+
+    // Batch exact-identity product read. Input rows use the same identity
+    // contract as bulk v2 writes (distinct product_id/sku/model fields, or
+    // external_product_id with optional id_kind); every row is attributed by
+    // its input index and is explicitly either found with a full catalog
+    // payload or not found/failed with a machine-readable error. Resolution is
+    // preselected in one SQL round trip and matched exactly in PHP, so case,
+    // padding and numeric-looking aliases can never collapse into another row.
+    // Like the paginated products listing, only active products are visible.
+    private function batchProducts($payload) {
+        $items = isset($payload['items']) && is_array($payload['items']) ? array_values($payload['items']) : array();
+        $states = array();
+        $product_id_lookups = array();
+        $sku_lookups = array();
+        $model_lookups = array();
+
+        foreach ($items as $index => $item) {
+            if (!is_array($item)) {
+                $item = array();
+            }
+            $verbatim = $this->rowVerbatimIdentity($item);
+
+            if ($index >= self::BULK_MAX_ROWS) {
+                $states[$index] = array(
+                    'verbatim' => $verbatim,
+                    'parsed' => null,
+                    'resolved_product_id' => null,
+                    'error_code' => 'too_many_rows',
+                    'error_message' => 'Row exceeds the per-request ceiling of ' . self::BULK_MAX_ROWS . ' rows (products.batch.max_rows); chunk the request and replay the tail'
+                );
+                continue;
+            }
+
+            $parsed = $this->parseBulkRowIdentity($item);
+            $state = array(
+                'verbatim' => $verbatim,
+                'parsed' => $parsed,
+                'resolved_product_id' => null,
+                'error_code' => $parsed['error_code'],
+                'error_message' => $parsed['error_message']
+            );
+            $states[$index] = $state;
+
+            if ($parsed['error_code'] !== null) {
+                continue;
+            }
+
+            if ($parsed['kind'] === 'product_id') {
+                $product_id_lookups[(int)$parsed['lookup']] = true;
+            } elseif ($parsed['kind'] === 'sku') {
+                $sku_lookups[$parsed['lookup']] = true;
+            } elseif ($parsed['kind'] === 'model') {
+                $model_lookups[$parsed['lookup']] = true;
+            } elseif ($parsed['kind'] === 'alias') {
+                $sku_lookups[$parsed['lookup']] = true;
+                $model_lookups[$parsed['lookup']] = true;
+            }
         }
 
-        $items = array();
-        foreach ($rows as $row) {
-            $items[] = array(
-                'external_id' => (string)$row['product_id'],
-                'sku' => $row['sku'] !== '' ? (string)$row['sku'] : (string)$row['model'],
-                'model' => (string)$row['model'],
-                'name' => isset($row['name']) ? (string)$row['name'] : '',
-                'description' => isset($row['description']) ? (string)$row['description'] : '',
-                'price' => isset($row['price']) ? (float)$row['price'] : null,
-                'special_price' => isset($row['special_price']) && $row['special_price'] !== null ? (float)$row['special_price'] : null,
-                'quantity' => isset($row['quantity']) ? (int)$row['quantity'] : null,
-                'category_id' => isset($row['category_id']) ? (string)$row['category_id'] : null,
-                'category_name' => isset($row['category_name']) ? (string)$row['category_name'] : null,
-                'image_urls' => $this->productImageUrls((int)$row['product_id'], isset($row['image']) ? (string)$row['image'] : '')
+        list($products_by_id, $sku_matches, $model_matches) = $this->batchProductIdentityCandidates(
+            array_keys($product_id_lookups),
+            array_keys($sku_lookups),
+            array_keys($model_lookups));
+
+        $resolved_ids = array();
+        foreach ($states as $index => $state) {
+            if ($state['error_code'] !== null || $state['parsed'] === null) {
+                continue;
+            }
+
+            list($product_id, $resolve_error, $resolve_message) = $this->resolveBatchReadProductId(
+                $state['parsed'], $products_by_id, $sku_matches, $model_matches);
+            if ($product_id > 0) {
+                $states[$index]['resolved_product_id'] = $product_id;
+                $resolved_ids[$product_id] = true;
+            } else {
+                $states[$index]['error_code'] = $resolve_error;
+                $states[$index]['error_message'] = $resolve_message;
+            }
+        }
+
+        $payloads = $this->batchProductPayloadsById(array_keys($resolved_ids));
+        $results = array();
+        $found_count = 0;
+
+        foreach ($states as $index => $state) {
+            if ($state['error_code'] !== null) {
+                $results[] = $this->batchProductReadFailure(
+                    $index,
+                    $state['verbatim'],
+                    $state['error_code'],
+                    $state['error_message'],
+                    $state['resolved_product_id']);
+                continue;
+            }
+
+            $product_id = (int)$state['resolved_product_id'];
+            if (!isset($payloads[$product_id])) {
+                // Defense in depth: identity preselection and payload loading use
+                // the same active-catalog visibility, so this should be unreachable.
+                // If a schema/version difference ever splits them, the row stays an
+                // explicit miss rather than silently attaching the wrong product.
+                $results[] = $this->batchProductReadFailure(
+                    $index,
+                    $state['verbatim'],
+                    'product_not_found',
+                    'Product payload not found: ' . $state['parsed']['identity'],
+                    $product_id);
+                continue;
+            }
+
+            $found_count++;
+            $results[] = array(
+                'index' => $index,
+                'external_product_id' => $state['verbatim'],
+                'resolved_product_id' => $product_id,
+                'found' => true,
+                'product' => $payloads[$product_id]
             );
         }
 
         return array(
-            'items' => $items,
-            'has_more' => $has_more,
-            'next_cursor' => $has_more ? (string)($offset + $limit) : null
+            'total_count' => count($items),
+            'found_count' => $found_count,
+            // Unresolved is the exact complement of found: it includes explicit
+            // product_not_found misses as well as ambiguous/invalid rows, so the
+            // aggregate never mislabels an ambiguous duplicate as "missing".
+            'unresolved_count' => count($items) - $found_count,
+            'items' => $results
+        );
+    }
+
+    // Preselect active product candidates for all row identities in one query.
+    // SQL is only a broad candidate filter; exact byte-for-byte matching happens
+    // in PHP maps below, so collation or trailing-space semantics cannot widen
+    // an alias into a false positive.
+    private function batchProductIdentityCandidates($product_ids, $sku_identities, $model_identities) {
+        $products_by_id = array();
+        $sku_matches = array();
+        $model_matches = array();
+
+        $conditions = array();
+        if (count($product_ids)) {
+            $conditions[] = 'p.product_id IN (' . implode(',', array_map('intval', $product_ids)) . ')';
+        }
+
+        $has_sku = $this->tableColumnExists('product', 'sku');
+        if ($has_sku) {
+            foreach ($sku_identities as $identity) {
+                $conditions[] = "BINARY `sku` = '" . $this->db->escape($identity) . "'";
+            }
+        }
+        foreach ($model_identities as $identity) {
+            $conditions[] = "BINARY `model` = '" . $this->db->escape($identity) . "'";
+        }
+
+        if (!count($conditions)) {
+            return array($products_by_id, $sku_matches, $model_matches);
+        }
+
+        $sku_select = $has_sku ? 'p.sku' : "''";
+        $rows = $this->db->query("SELECT p.product_id, p.model, " . $sku_select . " AS sku
+            FROM `" . DB_PREFIX . "product` p
+            WHERE p.status = 1 AND (" . implode(' OR ', $conditions) . ")")->rows;
+
+        foreach ($rows as $row) {
+            $product_id = (int)$row['product_id'];
+            $products_by_id[$product_id] = $row;
+
+            if ($has_sku) {
+                $sku = (string)$row['sku'];
+                if (!array_key_exists($sku, $sku_matches)) {
+                    $sku_matches[$sku] = array();
+                }
+                $sku_matches[$sku][$product_id] = true;
+            }
+
+            $model = (string)$row['model'];
+            if (!array_key_exists($model, $model_matches)) {
+                $model_matches[$model] = array();
+            }
+            $model_matches[$model][$product_id] = true;
+        }
+
+        return array($products_by_id, $sku_matches, $model_matches);
+    }
+
+    private function resolveBatchReadProductId($parsed, $products_by_id, $sku_matches, $model_matches) {
+        if ($parsed['kind'] === 'product_id') {
+            $product_id = (int)$parsed['lookup'];
+            if (isset($products_by_id[$product_id])) {
+                return array($product_id, null, null);
+            }
+            return array(0, 'product_not_found', 'Product not found: ' . $parsed['identity']);
+        }
+
+        $matched = array();
+        if (($parsed['kind'] === 'sku' || $parsed['kind'] === 'alias') && array_key_exists($parsed['lookup'], $sku_matches)) {
+            foreach ($sku_matches[$parsed['lookup']] as $product_id => $unused) {
+                $matched[(int)$product_id] = true;
+            }
+        }
+        if (($parsed['kind'] === 'model' || $parsed['kind'] === 'alias') && array_key_exists($parsed['lookup'], $model_matches)) {
+            foreach ($model_matches[$parsed['lookup']] as $product_id => $unused) {
+                $matched[(int)$product_id] = true;
+            }
+        }
+
+        $kind = $parsed['kind'] === 'alias' ? '' : $parsed['kind'];
+        if (count($matched) === 1) {
+            return array((int)array_key_first($matched), null, null);
+        }
+        if (count($matched) === 0) {
+            return array(0, 'product_not_found', 'Product not found by exact ' . ($kind !== '' ? $kind : 'sku/model') . ' match: ' . $parsed['identity']);
+        }
+        return array(0, 'product_ambiguous', 'More than one product matches ' . ($kind !== '' ? $kind : 'sku/model') . ' exactly: ' . $parsed['identity']);
+    }
+
+    private function batchProductPayloadsById($product_ids) {
+        if (!count($product_ids)) {
+            return array();
+        }
+
+        $language_id = $this->getDefaultLanguageId();
+        $sku_select = $this->tableColumnExists('product', 'sku') ? 'p.sku' : "''";
+        $id_list = implode(',', array_map('intval', $product_ids));
+        $sql = $this->productCatalogSelectSql($language_id, $sku_select)
+            . " WHERE p.status = 1 AND p.product_id IN (" . $id_list . ")
+                ORDER BY p.product_id ASC";
+
+        $rows = $this->db->query($sql)->rows;
+        $image_urls = $this->productImageUrlsForRows($rows);
+        $payloads = array();
+        foreach ($rows as $row) {
+            $product_id = (int)$row['product_id'];
+            $payloads[$product_id] = $this->productPayloadFromRow(
+                $row,
+                isset($image_urls[$product_id]) ? $image_urls[$product_id] : array());
+        }
+
+        return $payloads;
+    }
+
+    // Batch form of productImageUrls(): one product_image query for the whole
+    // lookup rather than one per row. Primary images still lead each product's
+    // list and gallery order remains sort_order/product_image_id within that product.
+    private function productImageUrlsForRows($rows) {
+        $result = array();
+        $product_ids = array();
+        foreach ($rows as $row) {
+            $product_id = (int)$row['product_id'];
+            $product_ids[$product_id] = true;
+            $images = array();
+            $primary_image = isset($row['image']) ? (string)$row['image'] : '';
+            if ($primary_image !== '') {
+                $images[] = $this->imageUrl($primary_image);
+            }
+            $result[$product_id] = $images;
+        }
+
+        if (!count($product_ids)) {
+            return $result;
+        }
+
+        $query = $this->db->query("SELECT product_id, image FROM `" . DB_PREFIX . "product_image`
+            WHERE product_id IN (" . implode(',', array_map('intval', array_keys($product_ids))) . ")
+            ORDER BY product_id ASC, sort_order ASC, product_image_id ASC");
+        foreach ($query->rows as $image_row) {
+            if (!isset($image_row['image']) || trim((string)$image_row['image']) === '') {
+                continue;
+            }
+            $product_id = (int)$image_row['product_id'];
+            if (!isset($result[$product_id])) {
+                $result[$product_id] = array();
+            }
+            $result[$product_id][] = $this->imageUrl((string)$image_row['image']);
+        }
+
+        foreach ($result as $product_id => $images) {
+            $result[$product_id] = array_values(array_unique($images));
+        }
+
+        return $result;
+    }
+
+    private function batchProductReadFailure($index, $verbatim, $error_code, $error_message, $resolved_product_id = null) {
+        return array(
+            'index' => $index,
+            'external_product_id' => $verbatim,
+            'resolved_product_id' => $resolved_product_id !== null ? (int)$resolved_product_id : null,
+            'found' => false,
+            'error_code' => $error_code,
+            'error_message' => $error_message
         );
     }
 
@@ -781,6 +1101,32 @@ class Delegat extends \Opencart\System\Engine\Controller {
     // an arbitrary LIMIT-1 pick, and a numeric sku is never confused with a
     // product id when id_kind says sku.
     private function resolveBulkRowProductId($item) {
+        $parsed = $this->parseBulkRowIdentity($item);
+        if ($parsed['error_code'] !== null) {
+            return array(0, $parsed['error_code'], $parsed['error_message']);
+        }
+
+        if ($parsed['kind'] === 'product_id') {
+            $product_id = (int)$parsed['lookup'];
+            if (!$this->productExists($product_id)) {
+                return array(0, 'product_not_found', 'Product not found: ' . $parsed['identity']);
+            }
+            return array($product_id, null, null);
+        }
+
+        if ($parsed['kind'] === 'sku' || $parsed['kind'] === 'model') {
+            return $this->resolveProductIdByExactAlias($parsed['kind'], $parsed['lookup']);
+        }
+
+        return $this->resolveProductIdByExactAlias('', $parsed['lookup']);
+    }
+
+    // Parses the bulk identity contract without touching the database. The
+    // product read batch uses the same parse result to preselect candidates in
+    // one SQL round trip, while the write endpoints keep the per-row resolver
+    // above. `lookup` is byte-for-byte for aliases; only the legacy numeric
+    // product-id form trims surrounding whitespace exactly as v1's int cast did.
+    private function parseBulkRowIdentity($item) {
         $id_kind = '';
         $identity = '';
 
@@ -807,30 +1153,24 @@ class Delegat extends \Opencart\System\Engine\Controller {
                 // An explicit but unknown id_kind must not silently degrade into
                 // the legacy numeric-id interpretation: a numeric SKU would then
                 // write the product with that numeric id instead of failing.
-                return array(0, 'invalid_id_kind', 'Unknown id_kind: ' . $raw_kind . ' (expected product_id, sku, or model)');
+                return $this->bulkIdentityParseError('invalid_id_kind', 'Unknown id_kind: ' . $raw_kind . ' (expected product_id, sku, or model)', $identity);
             }
-        } else {
-            $identity = trim($identity);
         }
 
         if ($identity === '') {
-            return array(0, 'identity_missing', 'Row carries no product identity (product_id, sku, model, or external_product_id)');
+            return $this->bulkIdentityParseError('identity_missing', 'Row carries no product identity (product_id, sku, model, or external_product_id)', $identity);
         }
 
         if ($id_kind === 'product_id') {
             $numeric_identity = trim($identity);
             if (!ctype_digit($numeric_identity) || (int)$numeric_identity <= 0) {
-                return array(0, 'invalid_product_id', 'product_id identity must be a positive integer, got: ' . $identity);
+                return $this->bulkIdentityParseError('invalid_product_id', 'product_id identity must be a positive integer, got: ' . $identity, $identity);
             }
-            $product_id = (int)$numeric_identity;
-            if (!$this->productExists($product_id)) {
-                return array(0, 'product_not_found', 'Product not found: ' . $identity);
-            }
-            return array($product_id, null, null);
+            return $this->bulkIdentityParseSuccess('product_id', $identity, $numeric_identity);
         }
 
         if ($id_kind === 'sku' || $id_kind === 'model') {
-            return $this->resolveProductIdByExactAlias($id_kind, $identity);
+            return $this->bulkIdentityParseSuccess($id_kind, $identity, $identity);
         }
 
         // Legacy default for a bare external_product_id. v1 cast the value to
@@ -839,14 +1179,30 @@ class Delegat extends \Opencart\System\Engine\Controller {
         // of the exact alias value.
         $numeric_identity = trim($identity);
         if (ctype_digit($numeric_identity) && (int)$numeric_identity > 0) {
-            $product_id = (int)$numeric_identity;
-            if (!$this->productExists($product_id)) {
-                return array(0, 'product_not_found', 'Product not found: ' . $identity);
-            }
-            return array($product_id, null, null);
+            return $this->bulkIdentityParseSuccess('product_id', $identity, $numeric_identity);
         }
 
-        return $this->resolveProductIdByExactAlias('', $identity);
+        return $this->bulkIdentityParseSuccess('alias', $identity, $identity);
+    }
+
+    private function bulkIdentityParseSuccess($kind, $identity, $lookup) {
+        return array(
+            'kind' => $kind,
+            'identity' => $identity,
+            'lookup' => $lookup,
+            'error_code' => null,
+            'error_message' => null
+        );
+    }
+
+    private function bulkIdentityParseError($error_code, $error_message, $identity = '') {
+        return array(
+            'kind' => '',
+            'identity' => $identity,
+            'lookup' => '',
+            'error_code' => $error_code,
+            'error_message' => $error_message
+        );
     }
 
     // Exact-match alias resolution over distinct product ids. With an empty
